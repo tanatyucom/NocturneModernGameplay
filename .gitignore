@@ -1,0 +1,30 @@
+# .NET / Visual Studio build output
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+.claude/settings.local.json
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+
+# Generated binaries and transient files
+*.dll
+*.exe
+*.pdb
+*.log
+*.tmp
+*.cache
+
+# Local reverse-engineering and media-analysis artifacts
+.analysis/
+.codex-video-tools/
+.video-analysis/
+.package-audit-temp/
+diagnostics/*.bin
+
+# Local captures used during investigation
+Codex 画像 *.png
