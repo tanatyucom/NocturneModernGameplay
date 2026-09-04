@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net6.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>NocturneModernGameplay</AssemblyName>
     <RootNamespace>NocturneModernGameplay</RootNamespace>
     <Nullable>enable</Nullable>
@@ -11,6 +12,9 @@
   <PropertyGroup Condition="'$(GameDir)' == ''">
     <GameDir>C:\Program Files (x86)\Steam\steamapps\common\smt3hd</GameDir>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="legacy\**\*.cs" />
+  </ItemGroup>
   <ItemGroup>
     <Reference Include="MelonLoader">
       <HintPath>$(GameDir)\MelonLoader\net6\MelonLoader.dll</HintPath>

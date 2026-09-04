@@ -20,6 +20,13 @@ namespace NocturneModernGameplay
         public string Version { get; set; } = string.Empty;
         public string Warning { get; set; } = string.Empty;
         public string Notes { get; set; } = string.Empty;
+
+        // Optional multi-value surface (e.g. Chance: Disabled/Native/
+        // Always). Null/empty AllowedValues means this feature stays
+        // boolean-only (Enabled/SetEnabled) for full backward compatibility
+        // with a GUI that does not understand Value at all.
+        public string[]? AllowedValues { get; set; }
+        public string? Value { get; set; }
     }
 
     internal sealed class ProviderMetadataSnapshot
@@ -36,6 +43,10 @@ namespace NocturneModernGameplay
         public string ProviderId { get; set; } = string.Empty;
         public string FeatureId { get; set; } = string.Empty;
         public bool Enabled { get; set; }
+
+        // When non-null/non-empty, this is a multi-value selection request
+        // (takes precedence over Enabled) - see GameplayFeatureRegistry.TrySetValue.
+        public string? Value { get; set; }
     }
 
     internal static class GuiMetadataBridge
@@ -57,7 +68,9 @@ namespace NocturneModernGameplay
                         Category = feature.Category,
                         SortOrder = feature.SortOrder,
                         RequiresRestart = feature.RequiresRestart,
-                        Version = "0.1.0"
+                        Version = "0.1.0",
+                        AllowedValues = feature.AllowedValues,
+                        Value = feature.Value
                     }).ToList()
             };
             Directory.CreateDirectory(ModDirectory);
@@ -93,8 +106,9 @@ namespace NocturneModernGameplay
                 foreach (FeatureToggleRequest request in requests.Where(item =>
                              string.Equals(item.ProviderId, ProviderId, StringComparison.OrdinalIgnoreCase)))
                 {
-                    changed |= GameplayFeatureRegistry.TrySetEnabled(
-                        request.FeatureId, request.Enabled);
+                    changed |= !string.IsNullOrEmpty(request.Value)
+                        ? GameplayFeatureRegistry.TrySetValue(request.FeatureId, request.Value)
+                        : GameplayFeatureRegistry.TrySetEnabled(request.FeatureId, request.Enabled);
                 }
                 if (changed)
                 {

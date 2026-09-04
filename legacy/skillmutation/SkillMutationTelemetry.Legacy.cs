@@ -13,54 +13,224 @@ namespace NocturneModernGameplay
 {
     internal static class SkillMutationTelemetry
     {
-        private sealed class ExperimentalCandidateInfo
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
+
+        // Resolved once and cached: moduleBase + RVA, matching the pattern
+        // already used in SkillMutationAlways.cs, to avoid depending on a
+        // fixed absolute address (ASLR / module-base differences).
+        // internal (not private): read from DevilTransitionTelemetryPatch,
+        // a separate top-level class in this same file, not a nested one.
+        private static IntPtr _gameAssemblyBase = IntPtr.Zero;
+        internal static IntPtr GameAssemblyBase
+        {
+            get
+            {
+                if (_gameAssemblyBase == IntPtr.Zero)
+                    _gameAssemblyBase = GetModuleHandle("GameAssembly.dll");
+                return _gameAssemblyBase;
+            }
+        }
+
+        // RVAs (relative to GameAssembly.dll image base) for the two static
+        // field slots identified via static analysis:
+        //   GBWK slot   -> confirmed to be the real rstinit.GBWK singleton
+        //                  (same slot resolved from both rstCalc's own GBWK
+        //                  assignment and rstCalcSeqDevilLevelUp).
+        //   TARGET slot -> a SEPARATE static slot, referenced by nearly all
+        //                  rst* functions alongside the GBWK slot. Its
+        //                  true type/identity is still UNKNOWN; this
+        //                  telemetry exists specifically to observe it.
+        internal const long GbwkSlotRva = 0x2e464b8;
+        internal const long TargetSlotRva = 0x2e4ed30;
+
+        // Read-only. Dumps pCurrentStock and WorkStock pointers AND their
+        // full skill arrays side by side, at a named checkpoint. Purpose:
+        // directly observe whether a Mutation result written to WorkStock's
+        // skill array ever appears in pCurrentStock's skill array (a "commit"),
+        // or whether pCurrentStock never changes (WorkStock is scratch-only),
+        // or whether pCurrentStock changes first (WorkStock is a follower).
+        // Never writes anything. Change-detected to avoid flooding logs.
+        private static string _lastPairedSnapshot = string.Empty;
+
+        internal static void ObservePairedSkillSnapshot(string checkpoint)
+        {
+            try
+            {
+                var gbwk = rstinit.GBWK;
+                if (gbwk == null || gbwk.Pointer == IntPtr.Zero) return;
+                var currentStock = gbwk.pCurrentStock;
+                var workStock = gbwk.WorkStock;
+                IntPtr currentStockPtr = currentStock?.Pointer ?? IntPtr.Zero;
+                IntPtr workStockPtr = workStock?.Pointer ?? IntPtr.Zero;
+
+                string currentSkills = DescribeSkillsSafe(currentStock);
+                string workSkills = DescribeSkillsSafe(workStock);
+
+                var seq = gbwk.SeqInfo;
+                string state =
+                    $"{checkpoint}|" +
+                    $"currentStockPtr=0x{currentStockPtr.ToInt64():X} workStockPtr=0x{workStockPtr.ToInt64():X}|" +
+                    $"currentSkills=[{currentSkills}] workSkills=[{workSkills}]|" +
+                    $"PUpSkillIndex={gbwk.PUpSkillIndex} PUpSkillID={gbwk.PUpSkillID}|" +
+                    $"seq={seq.Current}/{seq.Last}|" +
+                    $"active=[{SkillMutationLearnAsNew.ActiveSummary}] queue={SkillMutationLearnAsNew.QueueDepth}";
+
+                if (string.Equals(state, _lastPairedSnapshot, StringComparison.Ordinal)) return;
+                _lastPairedSnapshot = state;
+
+                MelonLogger.Msg(
+                    "[NocturneModernGameplay] PAIRED-SKILL-SNAPSHOT " + checkpoint + "; " +
+                    $"frame={UnityEngine.Time.frameCount} " +
+                    $"currentStockPtr=0x{currentStockPtr.ToInt64():X} workStockPtr=0x{workStockPtr.ToInt64():X} " +
+                    $"currentSkills=[{currentSkills}] workSkills=[{workSkills}] " +
+                    $"PUpSkillIndex={gbwk.PUpSkillIndex} PUpSkillID={gbwk.PUpSkillID} " +
+                    $"seqCurrent={seq.Current} seqLast={seq.Last} " +
+                    $"active=[{SkillMutationLearnAsNew.ActiveSummary}] queue={SkillMutationLearnAsNew.QueueDepth}.");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] PAIRED-SKILL-SNAPSHOT {checkpoint} unavailable: {ex.Message}");
+            }
+        }
+
+        private static string DescribeSkillsSafe(Il2Cppnewdata_H.datUnitWork_t? stock)
+        {
+            if (stock == null || stock.Pointer == IntPtr.Zero) return "n/a";
+            try
+            {
+                var sb = new StringBuilder();
+                int count = Math.Min(stock.skill.Length, 8);
+                for (int i = 0; i < count; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append(i).Append(':').Append(unchecked((ushort)stock.skill[i]));
+                }
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return $"read-failed-safely:{ex.Message}";
+            }
+        }
+
+        private enum CandidateState
+        {
+            AwaitingResult,
+            ResultRecorded,
+            Handled
+        }
+
+        private sealed class CandidateInfo
         {
             internal Il2Cppnewdata_H.datUnitWork_t Stock = null!;
             internal int Index;
             internal ushort OriginalSkill;
             internal ushort MutatedSkill;
-            internal string LastSkills = string.Empty;
-            internal bool AwaitingResult = true;
-            internal bool Completed;
+            internal ushort SelectionResult;
+            internal string LastObservedSkills = string.Empty;
+            internal CandidateState State;
         }
 
-        private static readonly Dictionary<(IntPtr Stock, int Index), ExperimentalCandidateInfo>
-            ExperimentalCandidates = new();
-        private static Il2Cppnewdata_H.datUnitWork_t? _candidate;
-        private static int _candidateIndex = -1;
-        private static ushort _originalSkill;
-        private static ushort _mutatedSkill;
-        private static string _lastObservedSkills = string.Empty;
+        private static readonly Dictionary<(IntPtr Stock, int Index), CandidateInfo> Candidates = new();
         private static string _lastResultState = string.Empty;
 
-        // Read-only summary of the current single-candidate global state, for
-        // telemetry only. Does not affect any candidate-handling behavior.
+        // Read-only. Investigates whether GBWK+0x7a (the seq=11 event-type
+        // reservation field) and WorkStock+0x7c (the per-unit message/SE
+        // selection field) survive a synthetic Learn-As-New forget-flow, or
+        // whether GBWK+0x7a is lost while WorkStock+0x7c persists. Never
+        // writes to any of these fields. Call sites are existing hooks only;
+        // no new Harmony patches are introduced by this addition.
+        internal static void ObserveEventLifecycle(string checkpoint)
+        {
+            try
+            {
+                var gbwk = rstinit.GBWK;
+                if (gbwk == null || gbwk.Pointer == IntPtr.Zero)
+                {
+                    MelonLogger.Msg($"[NocturneModernGameplay] EVENT-LIFECYCLE {checkpoint}; gbwk=unavailable.");
+                    return;
+                }
+                var seq = gbwk.SeqInfo;
+                var currentStock = gbwk.pCurrentStock;
+                var workStock = gbwk.WorkStock;
+                int currentUnit = currentStock == null || currentStock.Pointer == IntPtr.Zero ? -1 : currentStock.id;
+                IntPtr workStockPtr = workStock?.Pointer ?? IntPtr.Zero;
+
+                byte gbwk7a_lo = Marshal.ReadByte(gbwk.Pointer, 0x7a);
+                byte gbwk7a_hi = Marshal.ReadByte(gbwk.Pointer, 0x7b);
+                int gbwk7a = gbwk7a_lo | (gbwk7a_hi << 8);
+                string workStock7c = workStockPtr != IntPtr.Zero
+                    ? Marshal.ReadByte(workStockPtr, 0x7c).ToString() : "n/a";
+
+                MelonLogger.Msg(
+                    "[NocturneModernGameplay] EVENT-LIFECYCLE " + checkpoint + "; " +
+                    $"frame={UnityEngine.Time.frameCount} " +
+                    $"gbwkPtr=0x{gbwk.Pointer.ToInt64():X} gbwk+0x7a={gbwk7a} " +
+                    $"workStockPtr=0x{workStockPtr.ToInt64():X} workStock+0x7c={workStock7c} " +
+                    $"seqCurrent={seq.Current} seqLast={seq.Last} seqChange={seq.Change} " +
+                    $"targetIndex={gbwk.TargetIndex} currentUnit={currentUnit} " +
+                    $"active=[{SkillMutationLearnAsNew.ActiveSummary}].");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] EVENT-LIFECYCLE unavailable: {ex.Message}");
+            }
+        }
+
+        // Edge detection for seq==11 entry/return, layered onto the existing
+        // per-frame rawSeq11 observation. Read-only; does not replace or
+        // alter ObserveRstCalcDispatchState's own change-detected logging.
+        private static int _lastObservedRawSeq11 = -1;
+
+        internal static void ObserveSeq11Edge()
+        {
+            try
+            {
+                var gbwk = rstinit.GBWK;
+                if (gbwk == null || gbwk.Pointer == IntPtr.Zero) return;
+                IntPtr seqInfoPtr = Marshal.ReadIntPtr(gbwk.Pointer, 0x10);
+                int rawSeq11 = seqInfoPtr != IntPtr.Zero ? Marshal.ReadByte(seqInfoPtr, 0x11) : -1;
+
+                if (rawSeq11 == 11 && _lastObservedRawSeq11 != 11)
+                {
+                    ObserveEventLifecycle("seq11-entry");
+                    ObservePairedSkillSnapshot("seq10-to-11-entry");
+                }
+                else if (_lastObservedRawSeq11 == 11 && rawSeq11 != 11)
+                {
+                    ObserveEventLifecycle("seq11-return");
+                    ObservePairedSkillSnapshot("seq11-return");
+                }
+                _lastObservedRawSeq11 = rawSeq11;
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] EVENT-LIFECYCLE seq11-edge unavailable: {ex.Message}");
+            }
+        }
+
         internal static string CandidateSummary
         {
             get
             {
-                if (!ExperimentalInlineRepro.Enabled)
-                    return _candidate == null || _candidate.Pointer == IntPtr.Zero
-                        ? "none"
-                        : $"unit={_candidate.id} index={_candidateIndex} " +
-                          $"original={_originalSkill} mutated={_mutatedSkill}";
-                if (ExperimentalCandidates.Count == 0) return "none";
+                if (Candidates.Count == 0) return "none";
                 var text = new StringBuilder();
-                foreach (var pair in ExperimentalCandidates)
+                foreach (var pair in Candidates)
                 {
                     if (text.Length > 0) text.Append(" | ");
-                    ExperimentalCandidateInfo item = pair.Value;
-                    text.Append($"key=0x{pair.Key.Stock.ToInt64():X}:{pair.Key.Index} ")
-                        .Append($"unit={item.Stock.id} original={item.OriginalSkill} ")
-                        .Append($"mutated={item.MutatedSkill} awaiting={item.AwaitingResult} ")
-                        .Append($"completed={item.Completed}");
+                    CandidateInfo item = pair.Value;
+                    text.Append("unit=").Append(item.Stock.id)
+                        .Append(" ptr=0x").Append(pair.Key.Stock.ToInt64().ToString("X"))
+                        .Append(" index=").Append(item.Index)
+                        .Append(" original=").Append(item.OriginalSkill)
+                        .Append(" mutated=").Append(item.MutatedSkill)
+                        .Append(" state=").Append(item.State);
                 }
                 return text.ToString();
             }
         }
-        internal static int CandidateCount => ExperimentalInlineRepro.Enabled
-            ? ExperimentalCandidates.Count
-            : ((_candidate != null && _candidate.Pointer != IntPtr.Zero) ? 1 : 0);
+        internal static int CandidateCount => Candidates.Count;
 
         internal static void ObserveResultState(string source)
         {
@@ -87,43 +257,75 @@ namespace NocturneModernGameplay
             }
         }
 
+        // Read-only. Compares the raw native SeqInfo+0x11 dispatch byte (the
+        // jump-table index confirmed via static analysis to gate whether
+        // rstCalc's control flow reaches the rstCalcSeqDevilLevelUp call site
+        // at all - value 6 is the only path that reaches it) against the
+        // existing managed SeqInfo properties (Current/Next/Last/Change/
+        // MesFlag/Timer) we have been reading throughout this investigation.
+        // This does not assume they are the same field; it exists specifically
+        // to let that be settled by direct observation instead of guesswork.
+        // Never writes to +0x11 or any other native field. Change-detected
+        // (like ObserveResultState above) to avoid flooding the log while the
+        // value is genuinely holding steady during a multi-second UI hold.
+        private static string _lastRstCalcDispatchState = string.Empty;
+
+        internal static void ObserveRstCalcDispatchState()
+        {
+            try
+            {
+                var work = rstinit.GBWK;
+                if (work == null || work.Pointer == IntPtr.Zero) return;
+                IntPtr seqInfoPtr = Marshal.ReadIntPtr(work.Pointer, 0x10);
+                byte rawSeq11 = seqInfoPtr != IntPtr.Zero ? Marshal.ReadByte(seqInfoPtr, 0x11) : (byte)0xFF;
+
+                var seq = work.SeqInfo;
+                var currentStock = work.pCurrentStock;
+                var workStock = work.WorkStock;
+                int currentUnit = currentStock == null || currentStock.Pointer == IntPtr.Zero ? -1 : currentStock.id;
+                int workUnit = workStock == null || workStock.Pointer == IntPtr.Zero ? -1 : workStock.id;
+
+                string state =
+                    $"rawSeq11={rawSeq11} " +
+                    $"managedCurrent={seq.Current} managedNext={seq.Next} managedLast={seq.Last} " +
+                    $"managedChange={seq.Change} managedMesFlag={seq.MesFlag} managedTimer={seq.Timer} " +
+                    $"active=[{SkillMutationLearnAsNew.ActiveSummary}] " +
+                    $"currentUnit={currentUnit} workUnit={workUnit}";
+                if (string.Equals(state, _lastRstCalcDispatchState, StringComparison.Ordinal)) return;
+                _lastRstCalcDispatchState = state;
+                MelonLogger.Msg($"[NocturneModernGameplay] RSTCALC-STATE frame={UnityEngine.Time.frameCount} {state}.");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] RSTCALC-STATE unavailable: {ex.Message}");
+            }
+        }
+
+
         internal static void RecordCandidate(
             Il2Cppnewdata_H.datUnitWork_t stock,
             int index,
             ushort selectionResult)
         {
             SkillMutationLearnAsNew.BeginMutationCandidate();
-            if (ExperimentalInlineRepro.Enabled)
-            {
-                var key = (stock.Pointer, index);
-                ushort original = index >= 0 && index < stock.skill.Length
-                    ? unchecked((ushort)stock.skill[index])
-                    : (ushort)0;
-                ExperimentalCandidates[key] = new ExperimentalCandidateInfo
-                {
-                    Stock = stock,
-                    Index = index,
-                    OriginalSkill = original,
-                    LastSkills = DescribeSkills(stock),
-                    AwaitingResult = true
-                };
-                MelonLogger.Msg(
-                    "[NocturneModernGameplay] EXPERIMENTAL_INLINE_REPRO candidate-recorded; " +
-                    $"frame={UnityEngine.Time.frameCount} unit={stock.id} " +
-                    $"candidateKey=0x{stock.Pointer.ToInt64():X}:{index} " +
-                    $"selectionResult={selectionResult} original={original} " +
-                    $"handled={SkillMutationLearnAsNew.IsSlotHandled(stock.Pointer, index)}.");
-            }
-            _candidate = stock;
-            _candidateIndex = index;
-            _originalSkill = index >= 0 && index < stock.skill.Length
+            var key = (stock.Pointer, index);
+            ushort originalSkill = index >= 0 && index < stock.skill.Length
                 ? unchecked((ushort)stock.skill[index])
                 : (ushort)0;
-            _lastObservedSkills = DescribeSkills(stock);
+            Candidates[key] = new CandidateInfo
+            {
+                Stock = stock,
+                Index = index,
+                OriginalSkill = originalSkill,
+                SelectionResult = selectionResult,
+                LastObservedSkills = DescribeSkills(stock),
+                State = CandidateState.AwaitingResult
+            };
             MelonLogger.Msg(
-                "[NocturneModernGameplay] MUTATION-PROBE candidate; " +
-                $"unit={stock.id} index={index} selectionResult={selectionResult} " +
-                $"original={_originalSkill} " +
+                "[NocturneModernGameplay] CANDIDATE-TRACE add; " +
+                $"unit={stock.id} stockPtr=0x{stock.Pointer.ToInt64():X} " +
+                $"index={index} selectionResult={selectionResult} " +
+                $"original={originalSkill} state=AwaitingResult count={Candidates.Count} " +
                 $"skills=[{DescribeSkills(stock)}].");
         }
 
@@ -131,46 +333,64 @@ namespace NocturneModernGameplay
         {
             SkillMutationLearnAsNew.NotifyResultActivity();
             string skillText = skill == 0 ? string.Empty : $" argumentSkill={skill}";
-            string stockText = _candidate == null || _candidate.Pointer == IntPtr.Zero
-                ? "stock=unavailable"
-                : $"unit={_candidate.id} skills=[{DescribeSkills(_candidate)}]";
             MelonLogger.Msg(
                 $"[NocturneModernGameplay] MUTATION-PROBE write-{method}-{phase}; " +
-                $"index={_candidateIndex} original={_originalSkill} " +
-                $"mutated={_mutatedSkill}{skillText} {stockText}.");
+                $"candidateCount={Candidates.Count}{skillText} candidates=[{CandidateSummary}].");
         }
 
         internal static void ObserveMutationSequence(string method)
         {
-            if (ExperimentalInlineRepro.Enabled)
+            foreach (var pair in Candidates)
             {
-                ObserveExperimentalMutationSequences(method);
-                return;
-            }
-            if (_mutatedSkill == 0 || _candidate == null || _candidate.Pointer == IntPtr.Zero)
-            {
-                return;
-            }
+                CandidateInfo item = pair.Value;
+                if (item.State != CandidateState.ResultRecorded ||
+                    item.MutatedSkill == 0 || item.Stock == null ||
+                    item.Stock.Pointer == IntPtr.Zero) continue;
 
-            string current = DescribeSkills(_candidate);
-            if (string.Equals(current, _lastObservedSkills, StringComparison.Ordinal))
-            {
-                return;
+                string current = DescribeSkills(item.Stock);
+                if (string.Equals(current, item.LastObservedSkills, StringComparison.Ordinal)) continue;
+
+                // Read-only array-pointer identity check (per the confirmed
+                // Il2CppStructArray<int> semantics: getter/indexer always
+                // read live native memory, no managed cache). This compares
+                // item.Stock (the fixed reference held by this CandidateInfo)
+                // against the live GBWK.pCurrentStock at this exact instant,
+                // at both the datUnitWork_t level and the skill array level.
+                string identityCheck;
+                try
+                {
+                    var liveCurrentStock = rstinit.GBWK.pCurrentStock;
+                    IntPtr itemStockPtr = item.Stock.Pointer;
+                    IntPtr currentStockPtr = liveCurrentStock?.Pointer ?? IntPtr.Zero;
+                    IntPtr itemSkillArrayPtr = item.Stock.skill?.Pointer ?? IntPtr.Zero;
+                    IntPtr currentSkillArrayPtr = liveCurrentStock?.skill?.Pointer ?? IntPtr.Zero;
+                    bool sameStockPtr = itemStockPtr == currentStockPtr;
+                    bool sameSkillArrayPtr = itemSkillArrayPtr == currentSkillArrayPtr;
+                    identityCheck =
+                        $"itemStockPtr=0x{itemStockPtr.ToInt64():X} currentStockPtr=0x{currentStockPtr.ToInt64():X} " +
+                        $"itemSkillArrayPtr=0x{itemSkillArrayPtr.ToInt64():X} currentSkillArrayPtr=0x{currentSkillArrayPtr.ToInt64():X} " +
+                        $"sameStockPtr={sameStockPtr} sameSkillArrayPtr={sameSkillArrayPtr}";
+                }
+                catch (Exception ex)
+                {
+                    identityCheck = $"identity-check-failed-safely:{ex.Message}";
+                }
+
+                MelonLogger.Msg(
+                    $"[NocturneModernGameplay] MUTATION-PROBE sequence-change; " +
+                    $"method={method} unit={item.Stock.id} " +
+                    $"stockPtr=0x{pair.Key.Stock.ToInt64():X} index={item.Index} " +
+                    $"original={item.OriginalSkill} mutated={item.MutatedSkill} " +
+                    $"before=[{item.LastObservedSkills}] after=[{current}] " +
+                    $"{identityCheck}.");
+                item.LastObservedSkills = current;
+
+                SkillMutationLearnAsNew.TryConvertReplacementToAddition(
+                    item.Stock, item.Index, item.OriginalSkill, item.MutatedSkill);
+                item.LastObservedSkills = DescribeSkills(item.Stock);
+                if (SkillMutationLearnAsNew.IsSlotHandled(pair.Key.Stock, item.Index))
+                    item.State = CandidateState.Handled;
             }
-
-            MelonLogger.Msg(
-                $"[NocturneModernGameplay] MUTATION-PROBE sequence-change; " +
-                $"method={method} unit={_candidate.id} index={_candidateIndex} " +
-                $"original={_originalSkill} mutated={_mutatedSkill} " +
-                $"before=[{_lastObservedSkills}] after=[{current}].");
-            _lastObservedSkills = current;
-
-            SkillMutationLearnAsNew.TryConvertReplacementToAddition(
-                _candidate,
-                _candidateIndex,
-                _originalSkill,
-                _mutatedSkill);
-            _lastObservedSkills = DescribeSkills(_candidate);
         }
 
         internal static void RecordMutationResult(
@@ -178,115 +398,54 @@ namespace NocturneModernGameplay
             ushort originalSkill,
             ushort mutatedSkill)
         {
-            if (ExperimentalInlineRepro.Enabled)
+            CandidateInfo? match = null;
+            int awaiting = 0;
+            foreach (CandidateInfo item in Candidates.Values)
             {
-                ExperimentalCandidateInfo? match = null;
-                int count = 0;
-                foreach (ExperimentalCandidateInfo item in ExperimentalCandidates.Values)
-                {
-                    if (item.Stock.Pointer != stock.Pointer || !item.AwaitingResult) continue;
-                    match = item;
-                    count++;
-                }
-                if (count != 1 || match == null)
-                {
-                    MelonLogger.Warning(
-                        "[NocturneModernGameplay] EXPERIMENTAL_INLINE_REPRO mutation-result-unmatched; " +
-                        $"frame={UnityEngine.Time.frameCount} unit={stock.id} " +
-                        $"stockPtr=0x{stock.Pointer.ToInt64():X} original={originalSkill} " +
-                        $"mutated={mutatedSkill} awaitingMatches={count}; result not associated.");
-                    return;
-                }
+                if (item.Stock.Pointer != stock.Pointer ||
+                    item.State != CandidateState.AwaitingResult) continue;
+                awaiting++;
+                match = item;
+            }
 
-                match.OriginalSkill = originalSkill;
-                match.MutatedSkill = mutatedSkill;
-                match.AwaitingResult = false;
-                _candidate = match.Stock;
-                _candidateIndex = match.Index;
-                _originalSkill = originalSkill;
-                _mutatedSkill = mutatedSkill;
-                _lastObservedSkills = match.LastSkills;
-                MelonLogger.Msg(
-                    "[NocturneModernGameplay] EXPERIMENTAL_INLINE_REPRO mutation-result-associated; " +
-                    $"frame={UnityEngine.Time.frameCount} unit={stock.id} " +
-                    $"candidateKey=0x{stock.Pointer.ToInt64():X}:{match.Index} " +
-                    $"original={originalSkill} mutated={mutatedSkill}.");
+            if (awaiting != 1 || match == null)
+            {
+                string label = awaiting == 0 ? "resolve" : "resolve-ambiguous";
+                MelonLogger.Warning(
+                    $"[NocturneModernGameplay] CANDIDATE-TRACE {label}; " +
+                    $"unit={stock.id} stockPtr=0x{stock.Pointer.ToInt64():X} " +
+                    $"original={originalSkill} mutated={mutatedSkill} " +
+                    $"awaiting={awaiting} action=vanilla-fallback.");
                 return;
             }
-            _candidate = stock;
-            _originalSkill = originalSkill;
-            _mutatedSkill = mutatedSkill;
+
+            match.OriginalSkill = originalSkill;
+            match.MutatedSkill = mutatedSkill;
+            match.State = CandidateState.ResultRecorded;
             MelonLogger.Msg(
-                "[NocturneModernGameplay] MUTATION-PROBE mapping; " +
-                $"unit={stock.id} original={originalSkill} mutated={mutatedSkill}.");
-        }
-
-        private static void ObserveExperimentalMutationSequences(string method)
-        {
-            foreach (var pair in ExperimentalCandidates)
-            {
-                ExperimentalCandidateInfo item = pair.Value;
-                if (item.Completed || item.AwaitingResult || item.MutatedSkill == 0 ||
-                    item.Stock == null || item.Stock.Pointer == IntPtr.Zero) continue;
-
-                string current = DescribeSkills(item.Stock);
-                if (string.Equals(current, item.LastSkills, StringComparison.Ordinal)) continue;
-
-                var work = rstinit.GBWK;
-                IntPtr currentStockPtr = work.pCurrentStock?.Pointer ?? IntPtr.Zero;
-                IntPtr workStockPtr = work.WorkStock?.Pointer ?? IntPtr.Zero;
-                int currentUnit = work.pCurrentStock == null || currentStockPtr == IntPtr.Zero
-                    ? -1 : work.pCurrentStock.id;
-                int workUnit = work.WorkStock == null || workStockPtr == IntPtr.Zero
-                    ? -1 : work.WorkStock.id;
-                MelonLogger.Warning(
-                    "[NocturneModernGameplay] EXPERIMENTAL_INLINE_REPRO sequence-change; " +
-                    $"frame={UnityEngine.Time.frameCount} method={method} " +
-                    $"candidateKey=0x{pair.Key.Stock.ToInt64():X}:{pair.Key.Index} " +
-                    $"unit={item.Stock.id} original={item.OriginalSkill} mutated={item.MutatedSkill} " +
-                    $"currentUnit={currentUnit} workUnit={workUnit} " +
-                    $"currentStockPtr=0x{currentStockPtr.ToInt64():X} " +
-                    $"workStockPtr=0x{workStockPtr.ToInt64():X} " +
-                    $"PUpSkillIndex={work.PUpSkillIndex} PUpSkillID={work.PUpSkillID} " +
-                    $"SelectSkillID={work.SelectSkillID} " +
-                    $"handled={SkillMutationLearnAsNew.IsSlotHandled(pair.Key.Stock, pair.Key.Index)} " +
-                    $"before=[{item.LastSkills}] after=[{current}].");
-
-                item.LastSkills = current;
-                SkillMutationLearnAsNew.TryConvertReplacementToAddition(
-                    item.Stock, item.Index, item.OriginalSkill, item.MutatedSkill);
-                item.LastSkills = DescribeSkills(item.Stock);
-                item.Completed = SkillMutationLearnAsNew.IsSlotHandled(
-                    pair.Key.Stock, pair.Key.Index);
-            }
-        }
-
-        internal static void ClearExperimentalCandidatesAtLifecycleStart()
-        {
-            if (!ExperimentalInlineRepro.Enabled) return;
-            int previous = ExperimentalCandidates.Count;
-            ExperimentalCandidates.Clear();
-            _candidate = null;
-            _candidateIndex = -1;
-            _originalSkill = 0;
-            _mutatedSkill = 0;
-            _lastObservedSkills = string.Empty;
-            MelonLogger.Msg(
-                "[NocturneModernGameplay] EXPERIMENTAL_INLINE_REPRO candidates-cleared; " +
-                $"frame={UnityEngine.Time.frameCount} previousCount={previous}.");
+                "[NocturneModernGameplay] CANDIDATE-TRACE resolve; " +
+                $"unit={stock.id} stockPtr=0x{stock.Pointer.ToInt64():X} " +
+                $"index={match.Index} original={originalSkill} " +
+                $"mutated={mutatedSkill} state=ResultRecorded.");
         }
 
         internal static void RecordCore(string phase, int result = int.MinValue)
         {
             string resultText = result == int.MinValue ? string.Empty : $" result={result}";
-            string stockText = _candidate == null || _candidate.Pointer == IntPtr.Zero
-                ? "stock=unavailable"
-                : $"unit={_candidate.id} skills=[{DescribeSkills(_candidate)}]";
             MelonLogger.Msg(
                 $"[NocturneModernGameplay] MUTATION-PROBE core-{phase}; " +
-                $"index={_candidateIndex} original={_originalSkill} " +
-                $"mutated={_mutatedSkill}{resultText} {stockText}.");
+                $"candidateCount={Candidates.Count}{resultText} " +
+                $"candidates=[{CandidateSummary}].");
             DumpResultWork(phase);
+        }
+
+        internal static void ClearCandidatesAtLifecycleStart()
+        {
+            int previous = Candidates.Count;
+            Candidates.Clear();
+            MelonLogger.Msg(
+                "[NocturneModernGameplay] CANDIDATE-TRACE lifecycle-clear; " +
+                $"previous={previous} current={Candidates.Count}.");
         }
 
         private static void DumpResultWork(string phase)
@@ -577,6 +736,17 @@ namespace NocturneModernGameplay
     {
         private static void Prefix(ref int __0, ushort __1)
         {
+            var stock = rstinit.GBWK.WorkStock;
+            int index = rstinit.GBWK.PUpSkillIndex;
+            IntPtr stockPointer = stock == null ? IntPtr.Zero : stock.Pointer;
+            bool wouldSuppress = SkillMutationLearnAsNew.WouldSuppressOverwrite(
+                stockPointer, index);
+            MelonLogger.Msg(
+                "[NocturneModernGameplay] OVERWRITE-GATE observed; " +
+                $"unit={(stock == null || stock.Pointer == IntPtr.Zero ? -1 : stock.id)} " +
+                $"stockPtr=0x{stockPointer.ToInt64():X} index={index} " +
+                $"attemptedSkill={__1} wouldSuppress={wouldSuppress}.");
+
             SkillMutationTelemetry.LogPipelineSnapshot(
                 "rstOverWriteSkill", "prefix",
                 $"argSlotValueBefore={__0} argSkill={__1}");
@@ -586,6 +756,7 @@ namespace NocturneModernGameplay
                 rstinit.GBWK.PUpSkillIndex,
                 rstinit.GBWK.SelectSkillID,
                 __1);
+            SkillMutationTelemetry.ObservePairedSkillSnapshot("rstOverWriteSkill-prefix");
         }
 
         private static void Postfix(ref int __0, ushort __1)
@@ -599,6 +770,42 @@ namespace NocturneModernGameplay
                 rstinit.GBWK.PUpSkillIndex,
                 rstinit.GBWK.SelectSkillID,
                 __1);
+            SkillMutationTelemetry.ObservePairedSkillSnapshot("rstOverWriteSkill-postfix");
+
+            // Value-based confirmation of the actual write target (replaces
+            // the rejected fixed-address approach, whose refAddr was found to
+            // be a fixed managed-trampoline temp, not a native storage
+            // address). Read-only: only reads pCurrentStock/WorkStock skill
+            // arrays and compares values, writes nothing.
+            try
+            {
+                var gbwk = rstinit.GBWK;
+                var currentStock = gbwk.pCurrentStock;
+                var workStock = gbwk.WorkStock;
+                int index = gbwk.PUpSkillIndex;
+                IntPtr currentStockPtr = currentStock?.Pointer ?? IntPtr.Zero;
+                IntPtr workStockPtr = workStock?.Pointer ?? IntPtr.Zero;
+                int unit = currentStock == null || currentStockPtr == IntPtr.Zero ? -1 : currentStock.id;
+
+                int currentSkillAtIndex = (currentStock != null && index >= 0 && index < currentStock.skill.Length)
+                    ? unchecked((ushort)currentStock.skill[index]) : -1;
+                int workSkillAtIndex = (workStock != null && index >= 0 && index < workStock.skill.Length)
+                    ? unchecked((ushort)workStock.skill[index]) : -1;
+
+                bool currentMatchesArg = currentSkillAtIndex == __0;
+                bool workMatchesArg = workSkillAtIndex == __0;
+
+                MelonLogger.Msg(
+                    "[NocturneModernGameplay] OVERWRITE-VALUE-CHECK; " +
+                    $"unit={unit} index={index} mutatedSkill={__1} argSlotValueAfter={__0} " +
+                    $"currentStockPtr=0x{currentStockPtr.ToInt64():X} workStockPtr=0x{workStockPtr.ToInt64():X} " +
+                    $"currentSkillAtIndex={currentSkillAtIndex} workSkillAtIndex={workSkillAtIndex} " +
+                    $"currentMatchesArg={currentMatchesArg} workMatchesArg={workMatchesArg}.");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] OVERWRITE-VALUE-CHECK failed safely: {ex.Message}");
+            }
         }
     }
 
@@ -608,11 +815,13 @@ namespace NocturneModernGameplay
         private static void Prefix()
         {
             SkillMutationTelemetry.RecordCore("before");
+            SkillMutationTelemetry.ObservePairedSkillSnapshot("rstCalcSkillPowerUpCore-prefix");
         }
 
         private static void Postfix(sbyte __result)
         {
             SkillMutationTelemetry.RecordCore("after", __result);
+            SkillMutationTelemetry.ObservePairedSkillSnapshot("rstCalcSkillPowerUpCore-postfix");
         }
     }
 
@@ -659,9 +868,14 @@ namespace NocturneModernGameplay
             if (SkillMutationLearnAsNew.InterceptQueuedPowerUpReturn())
                 return false;
             SkillMutationTelemetry.ObserveMutationSequence("rstUpdateSeqSkillPowerUp-before");
+            SkillMutationTelemetry.ObservePairedSkillSnapshot("rstUpdateSeqSkillPowerUp-prefix");
             return true;
         }
-        private static void Postfix() => SkillMutationTelemetry.ObserveMutationSequence("rstUpdateSeqSkillPowerUp-after");
+        private static void Postfix()
+        {
+            SkillMutationTelemetry.ObserveMutationSequence("rstUpdateSeqSkillPowerUp-after");
+            SkillMutationTelemetry.ObservePairedSkillSnapshot("rstUpdateSeqSkillPowerUp-postfix");
+        }
     }
 
     [HarmonyPatch(typeof(rstupdate), nameof(rstupdate.rstUpdateSeqDestroySkill))]
@@ -699,6 +913,19 @@ namespace NocturneModernGameplay
         {
             SkillMutationTelemetry.LogPipelineSnapshot("rstUpdateSeqDestroyConfirm", "postfix");
             SkillMutationLearnAsNew.InsideDestroyConfirmScope = false;
+
+            // CONFIRMED via real-machine log comparison (two independent
+            // sessions, two different mutated skill ids, same failure
+            // pattern): after a forget-confirm resolves to seq=8/last=21,
+            // this was previously the one checkpoint that never verified
+            // whether the active Learn-As-New transaction could now be
+            // completed. rstUpdateSeqSkillPowerUp's own completion check
+            // only runs when *it* is called, which can happen on the very
+            // same frame - by which point seq has already moved on to 9 and
+            // native has already begun a fresh Mutation calculation. Checking
+            // here, at the exact moment the 8/21 boundary is confirmed,
+            // closes that window.
+            SkillMutationLearnAsNew.TryCompletePendingQueuedReturn("rstUpdateSeqDestroyConfirm");
         }
     }
 
@@ -708,10 +935,42 @@ namespace NocturneModernGameplay
         private static bool Prefix(ushort __0, ref sbyte __result)
         {
             SkillMutationLearnAsNew.NotifyResultActivity();
+            SkillMutationLearnAsNew.ObserveNormalCandidateRecurrence(__0);
             SkillMutationTelemetry.ObserveResultState($"capacity-before skill={__0}");
             SkillMutationTelemetry.LogUnifiedTimeline($"capacity-before skill={__0}");
             SkillMutationTelemetry.LogPipelineSnapshot(
                 "rstChkAddSkill", "prefix", $"argSkill={__0}");
+
+            // Phase 2E Correction: this is the REAL GBWK+0x32/+0x34 (the
+            // static slot confirmed to be rstinit.GBWK itself, not
+            // WorkStock), statically confirmed to be the seed value read
+            // just before the native skill-candidate-selection call
+            // (0x1827c0a90) inside rstUpdateSeqDefaultSkill. Deliberately
+            // labeled GBWK-SKILL-SEED to avoid any confusion with the
+            // pre-existing, unrelated "workStock+0x32/+0x34" telemetry
+            // (which reads from a different object - GBWK.WorkStock.Pointer,
+            // not GBWK.Pointer itself). Read-only; no write.
+            try
+            {
+                var gbwk = rstinit.GBWK;
+                if (gbwk != null && gbwk.Pointer != IntPtr.Zero)
+                {
+                    ushort gbwkSeed32 = unchecked((ushort)Marshal.ReadInt16(gbwk.Pointer, 0x32));
+                    ushort gbwkSeed34 = unchecked((ushort)Marshal.ReadInt16(gbwk.Pointer, 0x34));
+                    MelonLogger.Msg(
+                        "[NocturneModernGameplay] GBWK-SKILL-SEED; " +
+                        $"frame={UnityEngine.Time.frameCount} seqCurrent={gbwk.SeqInfo.Current} " +
+                        $"currentUnit={(gbwk.pCurrentStock?.id ?? -1)} workUnit={(gbwk.WorkStock?.id ?? -1)} " +
+                        $"gbwkPtr=0x{gbwk.Pointer.ToInt64():X} " +
+                        $"realGbwk+0x32={gbwkSeed32} realGbwk+0x34={gbwkSeed34} " +
+                        $"candidateSkill={__0}.");
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] GBWK-SKILL-SEED failed safely: {ex.Message}");
+            }
+
             SkillMutationTelemetry.LogHasSkillState(
                 "rstChkAddSkill-prefix",
                 rstinit.GBWK.WorkStock,
@@ -767,8 +1026,12 @@ namespace NocturneModernGameplay
         private static void Postfix()
         {
             SkillMutationTelemetry.ObserveResultState("update-after");
+            SkillMutationTelemetry.ObserveRstCalcDispatchState();
+            SkillMutationTelemetry.ObserveSeq11Edge();
             SkillMutationLearnAsNew.RecoverQueuedCompletionAtResultExit();
             SkillMutationLearnAsNew.CompleteQueuedAfterOuterUpdate();
+            SkillMutationLearnAsNew.ContinueOwnedDrainIfRequested();
+            SkillMutationLearnAsNew.FinalizeDrainAbortIfReady();
             SkillMutationLearnAsNew.TryStartQueuedAtResultBoundary();
         }
     }
@@ -1227,6 +1490,18 @@ namespace NocturneModernGameplay
         private static long _devilLevelUpCallCounter;
         private static long _setCurrentDevilCallCounter;
 
+        // Bit6-clear-boundary verification (read-only). Captured in Prefix,
+        // consumed in Postfix. Never written back to native memory; this only
+        // observes whether the boundary condition we are proposing for a
+        // future safe bit6 clear point ("previous unit's LvUp processing is
+        // confirmed complete") actually coincides with a unit change or the
+        // known "no more demons" sentinel (TargetIndex==16).
+        private static IntPtr _boundaryOldStockPtr;
+        private static int _boundaryOldUnit;
+        private static byte _boundaryOldFlags10;
+        private static sbyte _boundaryOldTargetIndex;
+        private static bool _boundaryCaptured;
+
         private static string Snapshot(string site, string phase, long call, string extra = "")
         {
             var gbwk = rstinit.GBWK;
@@ -1245,6 +1520,131 @@ namespace NocturneModernGameplay
             string workStock4a = workStockPtr != IntPtr.Zero
                 ? Marshal.ReadByte(workStockPtr, 0x4a).ToString() : "n/a";
 
+            // Read-only structural verification of GBWK+0x58 (candidate
+            // pTargetList / array-of-stock-pointers field). Never writes
+            // anything. Treats it as a possible Il2Cpp array (length at
+            // +0x18, element data starting at +0x20, 8-byte stride) purely
+            // to test the hypothesis - does not assume it is correct.
+            string field58Info;
+            try
+            {
+                IntPtr raw58 = Marshal.ReadIntPtr(gbwk.Pointer, 0x58);
+                if (raw58 == IntPtr.Zero)
+                {
+                    field58Info = "gbwk+0x58=0x0";
+                }
+                else
+                {
+                    int len = Marshal.ReadInt32(raw58, 0x18);
+                    int checkCount = len > 0 && len <= 16 ? len : 0;
+                    var elems = new StringBuilder();
+                    for (int i = 0; i < checkCount; i++)
+                    {
+                        IntPtr elem = Marshal.ReadIntPtr(raw58, 0x20 + i * 8);
+                        string tag = elem == currentStockPtr ? "=current"
+                            : elem == workStockPtr ? "=work" : "";
+                        if (i > 0) elems.Append(',');
+                        elems.Append(i).Append(":0x").Append(elem.ToInt64().ToString("X")).Append(tag);
+                    }
+                    field58Info = $"gbwk+0x58=0x{raw58.ToInt64():X} len={len} elems=[{elems}]";
+                }
+            }
+            catch (Exception ex)
+            {
+                field58Info = $"gbwk+0x58=read-failed-safely:{ex.Message}";
+            }
+
+            // Read-only observation of the SEPARATE "TARGET" static slot
+            // (moduleBase + RVA, never a fixed absolute address). Confirmed
+            // via static analysis to be a different static field than GBWK
+            // itself, yet referenced alongside it in nearly every rst*
+            // function. Its identity is still UNKNOWN - this reads its own
+            // +0x58 (pointer-array candidate) and +0x60 (int-array
+            // candidate) purely to test whether either holds the real
+            // per-unit target/candidate list.
+            string targetContextInfo;
+            try
+            {
+                IntPtr moduleBase = SkillMutationTelemetry.GameAssemblyBase;
+                if (moduleBase == IntPtr.Zero)
+                {
+                    targetContextInfo = "target=module-unavailable";
+                }
+                else
+                {
+                    IntPtr targetSlotAddr = new IntPtr(moduleBase.ToInt64() + SkillMutationTelemetry.TargetSlotRva);
+                    IntPtr targetObj = Marshal.ReadIntPtr(targetSlotAddr);
+                    if (targetObj == IntPtr.Zero)
+                    {
+                        targetContextInfo = "target=0x0";
+                    }
+                    else
+                    {
+                        string t58Info;
+                        try
+                        {
+                            IntPtr t58 = Marshal.ReadIntPtr(targetObj, 0x58);
+                            if (t58 == IntPtr.Zero)
+                            {
+                                t58Info = "target+0x58=0x0";
+                            }
+                            else
+                            {
+                                int len58 = Marshal.ReadInt32(t58, 0x18);
+                                int count58 = len58 > 0 && len58 <= 16 ? len58 : 0;
+                                var e58 = new StringBuilder();
+                                for (int i = 0; i < count58; i++)
+                                {
+                                    IntPtr elem = Marshal.ReadIntPtr(t58, 0x20 + i * 8);
+                                    string tag = elem == currentStockPtr ? "=current"
+                                        : elem == workStockPtr ? "=work" : "";
+                                    if (i > 0) e58.Append(',');
+                                    e58.Append(i).Append(":0x").Append(elem.ToInt64().ToString("X")).Append(tag);
+                                }
+                                t58Info = $"target+0x58=0x{t58.ToInt64():X} len={len58} elems=[{e58}]";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            t58Info = $"target+0x58=read-failed-safely:{ex.Message}";
+                        }
+
+                        string t60Info;
+                        try
+                        {
+                            IntPtr t60 = Marshal.ReadIntPtr(targetObj, 0x60);
+                            if (t60 == IntPtr.Zero)
+                            {
+                                t60Info = "target+0x60=0x0";
+                            }
+                            else
+                            {
+                                int len60 = Marshal.ReadInt32(t60, 0x18);
+                                int count60 = len60 > 0 && len60 <= 16 ? len60 : 0;
+                                var e60 = new StringBuilder();
+                                for (int i = 0; i < count60; i++)
+                                {
+                                    int idx = Marshal.ReadInt32(t60, 0x20 + i * 4);
+                                    if (i > 0) e60.Append(',');
+                                    e60.Append(i).Append(':').Append(idx);
+                                }
+                                t60Info = $"target+0x60=0x{t60.ToInt64():X} len={len60} indices=[{e60}]";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            t60Info = $"target+0x60=read-failed-safely:{ex.Message}";
+                        }
+
+                        targetContextInfo = $"target=0x{targetObj.ToInt64():X} {t58Info} {t60Info}";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                targetContextInfo = $"target=read-failed-safely:{ex.Message}";
+            }
+
             return
                 "[NocturneModernGameplay] DEVIL-TRANSITION-TRACE " + site + "-" + phase + "; " +
                 $"call={call} frame={UnityEngine.Time.frameCount} " +
@@ -1253,6 +1653,7 @@ namespace NocturneModernGameplay
                 $"currentUnit={currentUnit} workUnit={workUnit} " +
                 $"currentStockPtr=0x{currentStockPtr.ToInt64():X} workStockPtr=0x{workStockPtr.ToInt64():X} " +
                 $"gbwk+0x4a={gbwk4a} workStock+0x4a={workStock4a} " +
+                $"{field58Info} {targetContextInfo} " +
                 $"PUpSkillIndex={gbwk.PUpSkillIndex} PUpSkillID={gbwk.PUpSkillID} " +
                 $"activeTransaction=[{SkillMutationLearnAsNew.ActiveSummary}] " +
                 $"candidateCount={SkillMutationTelemetry.CandidateCount} " +
@@ -1263,14 +1664,69 @@ namespace NocturneModernGameplay
         internal static void LogDevilLevelUpPrefix()
         {
             _devilLevelUpCallCounter++;
-            try { MelonLogger.Msg(Snapshot("rstCalcSeqDevilLevelUp", "prefix", _devilLevelUpCallCounter)); }
-            catch (Exception ex) { MelonLogger.Warning($"[NocturneModernGameplay] DEVIL-TRANSITION-TRACE prefix failed safely: {ex.Message}"); }
+            try
+            {
+                MelonLogger.Msg(Snapshot("rstCalcSeqDevilLevelUp", "prefix", _devilLevelUpCallCounter));
+                SkillMutationTelemetry.ObserveEventLifecycle("rstCalcSeqDevilLevelUp-prefix");
+                SkillMutationTelemetry.ObservePairedSkillSnapshot("rstCalcSeqDevilLevelUp-prefix");
+
+                // Capture "old" state for the bit6-clear-boundary check, read-only.
+                var gbwk = rstinit.GBWK;
+                var currentStock = gbwk?.pCurrentStock;
+                _boundaryOldStockPtr = currentStock?.Pointer ?? IntPtr.Zero;
+                _boundaryOldUnit = currentStock == null || currentStock.Pointer == IntPtr.Zero ? -1 : currentStock.id;
+                _boundaryOldFlags10 = _boundaryOldStockPtr != IntPtr.Zero
+                    ? Marshal.ReadByte(_boundaryOldStockPtr, 0x10) : (byte)0;
+                _boundaryOldTargetIndex = gbwk?.TargetIndex ?? -1;
+                _boundaryCaptured = true;
+            }
+            catch (Exception ex)
+            {
+                _boundaryCaptured = false;
+                MelonLogger.Warning($"[NocturneModernGameplay] DEVIL-TRANSITION-TRACE prefix failed safely: {ex.Message}");
+            }
         }
 
         internal static void LogDevilLevelUpPostfix(int result)
         {
-            try { MelonLogger.Msg(Snapshot("rstCalcSeqDevilLevelUp", "postfix", _devilLevelUpCallCounter, $"result={result}")); }
-            catch (Exception ex) { MelonLogger.Warning($"[NocturneModernGameplay] DEVIL-TRANSITION-TRACE postfix failed safely: {ex.Message}"); }
+            try
+            {
+                MelonLogger.Msg(Snapshot("rstCalcSeqDevilLevelUp", "postfix", _devilLevelUpCallCounter, $"result={result}"));
+
+                if (!_boundaryCaptured) return;
+                _boundaryCaptured = false; // consume once per Prefix/Postfix pair
+
+                var gbwk = rstinit.GBWK;
+                if (gbwk == null || gbwk.Pointer == IntPtr.Zero) return;
+                var newStock = gbwk.pCurrentStock;
+                IntPtr newStockPtr = newStock?.Pointer ?? IntPtr.Zero;
+                int newUnit = newStock == null || newStock.Pointer == IntPtr.Zero ? -1 : newStock.id;
+                byte newFlags10 = newStockPtr != IntPtr.Zero ? Marshal.ReadByte(newStockPtr, 0x10) : (byte)0;
+                sbyte newTargetIndex = gbwk.TargetIndex;
+
+                bool stockChanged = _boundaryOldStockPtr != newStockPtr;
+                bool noMoreDemons = newTargetIndex == 16;
+                bool wouldClearBit6 = stockChanged || noMoreDemons;
+
+                // Read-only: this NEVER writes to +0x10. It only reports what
+                // the proposed boundary condition would decide, for comparison
+                // against manual observation across the requested test matrix.
+                MelonLogger.Msg(
+                    "[NocturneModernGameplay] BIT6-BOUNDARY-CHECK; " +
+                    $"frame={UnityEngine.Time.frameCount} " +
+                    $"oldStockPtr=0x{_boundaryOldStockPtr.ToInt64():X} oldUnit={_boundaryOldUnit} " +
+                    $"oldFlags10=0x{_boundaryOldFlags10:X2}(bit6={(_boundaryOldFlags10 & 0x40) != 0}) " +
+                    $"oldTargetIndex={_boundaryOldTargetIndex} " +
+                    $"newStockPtr=0x{newStockPtr.ToInt64():X} newUnit={newUnit} " +
+                    $"newFlags10=0x{newFlags10:X2}(bit6={(newFlags10 & 0x40) != 0}) " +
+                    $"newTargetIndex={newTargetIndex} " +
+                    $"stockChanged={stockChanged} noMoreDemons={noMoreDemons} " +
+                    $"wouldClearBit6={wouldClearBit6}.");
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[NocturneModernGameplay] DEVIL-TRANSITION-TRACE postfix failed safely: {ex.Message}");
+            }
         }
 
         internal static void LogSetCurrentDevilPrefix()
@@ -1299,5 +1755,18 @@ namespace NocturneModernGameplay
     {
         private static void Prefix() => DevilTransitionTelemetryPatch.LogSetCurrentDevilPrefix();
         private static void Postfix(sbyte __result) => DevilTransitionTelemetryPatch.LogSetCurrentDevilPostfix(__result);
+    }
+
+    // Minimal hook at the confirmed native calc-return boundary
+    // (statically verified: rstCalc's own epilogue/ret at 0x18227f767-778,
+    // reached after the seq10->11->12->13 sequence completes within a single
+    // rstCalc call). Deliberately does nothing but mark that a previously
+    // requested drain abort may now be finalized - it never touches GBWK,
+    // stock, Pending, or _active itself. The actual finalize logic runs from
+    // rstUpdate's Postfix (a separate, already-existing safe checkpoint).
+    [HarmonyPatch(typeof(rstcalc), nameof(rstcalc.rstCalc))]
+    internal static class RstCalcReturnBoundaryPatch
+    {
+        private static void Postfix() => SkillMutationLearnAsNew.MarkDrainAbortReadyAfterCalc();
     }
 }

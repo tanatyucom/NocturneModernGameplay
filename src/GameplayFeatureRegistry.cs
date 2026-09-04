@@ -12,14 +12,29 @@ namespace NocturneModernGameplay
         internal string Category { get; init; } = string.Empty;
         internal int SortOrder { get; init; }
         internal bool RequiresRestart { get; init; }
+
+        // Legacy boolean surface, kept for any future plain on/off feature
+        // and for backward compatibility with a caller that only knows the
+        // old boolean protocol. For a multi-value feature (AllowedValues
+        // non-null), Enabled is a DERIVED display flag only
+        // (Value != "Disabled") - SetValue/Value are authoritative.
         internal bool Enabled { get; set; }
         internal Action<bool>? SetEnabled { get; init; }
+
+        // Multi-value surface (e.g. Chance: Disabled/Native/Always). Null
+        // AllowedValues means this feature is boolean-only.
+        internal string[]? AllowedValues { get; init; }
+        internal string? Value { get; set; }
+        internal Action<string>? SetValue { get; init; }
+
         internal Action? Sample { get; init; }
         internal Action? Shutdown { get; init; }
     }
 
     internal static class GameplayFeatureRegistry
     {
+        private static readonly string[] ChanceAllowedValues = { "Disabled", "Native", "Always" };
+
         private static readonly Dictionary<string, GameplayFeature> Features =
             new(StringComparer.OrdinalIgnoreCase);
 
@@ -31,38 +46,79 @@ namespace NocturneModernGameplay
         internal static void Initialize()
         {
             Features.Clear();
-            Features["skill_mutation_always"] = new GameplayFeature
+
+            // The old skill_mutation_always feature (SkillMutationAlways,
+            // Patch A/B/C) is retired - see ModMain.cs (no longer
+            // Initialize()'d) - and intentionally not re-registered here.
+            // Its Patch C site (0x18227E39C) is the same VA
+            // SkillMutationChanceControl's id-zero-path site patches with
+            // different bytes; the two must never both be active.
+            //
+            // Both Chance features route through GameplaySettingsService
+            // (NOT directly through SkillMutationChanceControl/
+            // SkillPowerUpChanceControl.SetMode) so a GUI-driven change is
+            // also persisted to config immediately - GameplaySettingsService
+            // is the single source of truth (see its own header comment).
+            RegisterChanceFeature(
+                "skill_mutation_chance", "Skill Mutation: Chance",
+                "変化可能なスキル候補が存在する場合のgenuine Skill Mutation発生確率です。" +
+                "0% = 抑止、通常 = native、100% = 候補があれば必ず試行(成立の可否はnative判定のまま)。",
+                GameplaySettingsService.SkillMutationChance,
+                GameplaySettingsService.SetSkillMutationChance,
+                SkillMutationChanceControl.Shutdown);
+            RegisterChanceFeature(
+                "skill_powerup_chance", "Skill Power-Up: Chance",
+                "ordinary Skill Power-Upの発生確率です。0% = 抑止、通常 = native、" +
+                "100% = bit6がCLEARな限りgenuine Mutationより優先して成立させます。",
+                GameplaySettingsService.SkillPowerUpChance,
+                GameplaySettingsService.SetSkillPowerUpChance,
+                SkillPowerUpChanceControl.Shutdown);
+        }
+
+        private static void RegisterChanceFeature(
+            string id, string name, string description, NativeChanceMode currentMode,
+            Action<NativeChanceMode> setMode, Action shutdown)
+        {
+            Features[id] = new GameplayFeature
             {
-                Id = "skill_mutation_always",
-                Name = "Skill Mutation: Always",
-                Description = "変化可能なスキルがある仲魔は、レベルアップ時のスキル変化判定に必ず成功します。",
+                Id = id,
+                Name = name,
+                Description = description,
                 Category = "Gameplay Change",
                 SortOrder = 90,
-                Enabled = true,
-                SetEnabled = SkillMutationAlways.SetEnabled,
-                Shutdown = SkillMutationAlways.Shutdown
-            };
-            Features["skill_mutation_learn_as_new"] = new GameplayFeature
-            {
-                Id = "skill_mutation_learn_as_new",
-                Name = "Skill Mutation: Learn as New",
-                Description = "スキル変化で元スキルを残し、変化後スキルを新規習得します。満杯時は忘れるスキルを選択します。",
-                Category = "Gameplay Change",
-                SortOrder = 100,
-                Enabled = true,
-                SetEnabled = SkillMutationLearnAsNew.SetEnabled,
-                Sample = SkillMutationLearnAsNew.Sample
+                AllowedValues = ChanceAllowedValues,
+                Value = currentMode.ToString(),
+                Enabled = currentMode != NativeChanceMode.Disabled,
+                SetValue = raw =>
+                {
+                    if (!Enum.TryParse(raw, ignoreCase: true, out NativeChanceMode mode))
+                        return;
+                    setMode(mode);
+                },
+                Shutdown = shutdown
             };
         }
 
         internal static bool TrySetEnabled(string featureId, bool enabled)
         {
-            if (!Features.TryGetValue(featureId, out GameplayFeature? feature))
+            if (!Features.TryGetValue(featureId, out GameplayFeature? feature) || feature.SetEnabled == null)
             {
                 return false;
             }
-            feature.SetEnabled?.Invoke(enabled);
+            feature.SetEnabled(enabled);
             feature.Enabled = enabled;
+            return true;
+        }
+
+        internal static bool TrySetValue(string featureId, string value)
+        {
+            if (!Features.TryGetValue(featureId, out GameplayFeature? feature) || feature.SetValue == null)
+            {
+                return false;
+            }
+            feature.SetValue(value);
+            feature.Value = value;
+            feature.Enabled = !string.Equals(value, "Disabled", StringComparison.OrdinalIgnoreCase);
             return true;
         }
 

@@ -27,6 +27,13 @@ namespace NocturneModernGameplay
         private static readonly byte[] ReturnTrueBytes = { 0xB0, 0x01, 0xC3 };
         private static bool _enabled = true;
         private static bool _patched;
+        // Diagnostic A/B flag (see usage in ApplyPatch): when true, Patch A
+        // is still applied but Patch B/C are left at vanilla bytes, so
+        // ordinary Skill Power-Up outcomes are no longer forced into
+        // Mutation. This diagnostic build defaults to TRUE - this is a
+        // temporary A/B test build, not the normal three-site patch
+        // configuration. Set to false to restore normal production behavior.
+        internal static readonly bool ExperimentalDisablePatchBAndC = true;
         private static IntPtr _patchAAddress;
         private static IntPtr _patchBAddress;
         private static IntPtr _patchCAddress;
@@ -83,6 +90,24 @@ namespace NocturneModernGameplay
                 PatchSiteState patchCState = VerifyPatchSite(
                     _patchCAddress, RollFailureVanillaBytes, RollFailurePatchedBytes, "Patch C");
 
+                // Diagnostic mode fail-closed requirement: this A/B test is
+                // only valid if B/C are GENUINELY vanilla at the moment the
+                // test starts - "we didn't write to them" is not sufficient
+                // if they were already patched from some earlier state
+                // (would silently invalidate the test by leaving A=patched,
+                // B=patched, C=patched instead of the required A=patched,
+                // B=vanilla, C=vanilla). Refuse to proceed rather than
+                // silently restore or silently accept an ambiguous state.
+                if (ExperimentalDisablePatchBAndC &&
+                    (patchBState != PatchSiteState.Vanilla || patchCState != PatchSiteState.Vanilla))
+                {
+                    throw new InvalidOperationException(
+                        "ExperimentalDisablePatchBAndC requires Patch B/C to be genuinely vanilla at " +
+                        $"startup; found patchBState={patchBState} patchCState={patchCState}. Refusing " +
+                        "to start the diagnostic test with an ambiguous byte state - restart the game " +
+                        "fully (not just reload the mod) so GameAssembly.dll is reloaded fresh, then retry.");
+                }
+
                 try
                 {
                     if (patchAState == PatchSiteState.Vanilla)
@@ -90,20 +115,77 @@ namespace NocturneModernGameplay
                         WriteExecutableBytes(_patchAAddress, PatchAPatchedBytes);
                         _patchAWritten = true;
                     }
-                    if (patchBState == PatchSiteState.Vanilla)
+                    // Diagnostic A/B flag: when true, Patch B/C are left at
+                    // vanilla bytes entirely - the dil=0 (ordinary Skill
+                    // Power-Up) vs dil=1 (Mutation) native RNG outcome is
+                    // NOT forced to dil=1 in this mode. Patch A (the pure
+                    // 1/4 skill-change-occurs gate) still applies normally.
+                    // Purpose: isolate whether forcing every skill-change
+                    // event into the Mutation branch (Patch B/C's effect)
+                    // is necessary for the observed presentation-loss
+                    // symptom, versus the symptom appearing purely from
+                    // Mutation frequency/concurrency regardless of how a
+                    // given event was routed into the Mutation branch.
+                    if (!ExperimentalDisablePatchBAndC)
                     {
-                        WriteExecutableBytes(_patchBAddress, RollFailurePatchedBytes);
-                        _patchBWritten = true;
+                        if (patchBState == PatchSiteState.Vanilla)
+                        {
+                            WriteExecutableBytes(_patchBAddress, RollFailurePatchedBytes);
+                            _patchBWritten = true;
+                        }
+                        if (patchCState == PatchSiteState.Vanilla)
+                        {
+                            WriteExecutableBytes(_patchCAddress, RollFailurePatchedBytes);
+                            _patchCWritten = true;
+                        }
                     }
-                    if (patchCState == PatchSiteState.Vanilla)
+                    else
                     {
-                        WriteExecutableBytes(_patchCAddress, RollFailurePatchedBytes);
-                        _patchCWritten = true;
+                        MelonLogger.Msg(
+                            "[NocturneModernGameplay] SkillMutationAlways diagnostic; " +
+                            "Patch B/C left vanilla (ExperimentalDisablePatchBAndC=true) - " +
+                            "ordinary Power-Up outcomes are NOT forced into Mutation.");
                     }
 
                     RequirePatchedBytes(_patchAAddress, PatchAPatchedBytes, "Patch A");
-                    RequirePatchedBytes(_patchBAddress, RollFailurePatchedBytes, "Patch B");
-                    RequirePatchedBytes(_patchCAddress, RollFailurePatchedBytes, "Patch C");
+                    if (!ExperimentalDisablePatchBAndC)
+                    {
+                        RequirePatchedBytes(_patchBAddress, RollFailurePatchedBytes, "Patch B");
+                        RequirePatchedBytes(_patchCAddress, RollFailurePatchedBytes, "Patch C");
+                    }
+                    else
+                    {
+                        // Final readback confirmation for the diagnostic
+                        // configuration specifically: A=patched, B=vanilla,
+                        // C=vanilla. Refuse the test outright if the actual
+                        // runtime bytes disagree with this expectation -
+                        // this is the last checkpoint before declaring the
+                        // A/B test ready, so no assumption is left
+                        // unverified.
+                        byte[] actualA = ReadBytes(_patchAAddress, PatchAPatchedBytes.Length);
+                        byte[] actualB = ReadBytes(_patchBAddress, RollFailureVanillaBytes.Length);
+                        byte[] actualC = ReadBytes(_patchCAddress, RollFailureVanillaBytes.Length);
+                        bool diagnosticConfigVerified =
+                            BytesEqual(actualA, PatchAPatchedBytes) &&
+                            BytesEqual(actualB, RollFailureVanillaBytes) &&
+                            BytesEqual(actualC, RollFailureVanillaBytes);
+
+                        MelonLogger.Msg(
+                            "[NocturneModernGameplay] SKILL-MUTATION-DIAGNOSTIC-BYTES; " +
+                            $"patchA={FormatBytes(actualA)} patchB={FormatBytes(actualB)} " +
+                            $"patchC={FormatBytes(actualC)} mode=A_ONLY " +
+                            $"verified={diagnosticConfigVerified}.");
+
+                        if (!diagnosticConfigVerified)
+                        {
+                            throw new InvalidOperationException(
+                                "Diagnostic byte configuration mismatch after apply - expected " +
+                                $"A={FormatBytes(PatchAPatchedBytes)} B={FormatBytes(RollFailureVanillaBytes)} " +
+                                $"C={FormatBytes(RollFailureVanillaBytes)}, got " +
+                                $"A={FormatBytes(actualA)} B={FormatBytes(actualB)} C={FormatBytes(actualC)}. " +
+                                "Refusing to declare the A/B test ready.");
+                        }
+                    }
                 }
                 catch
                 {
@@ -823,6 +905,7 @@ namespace NocturneModernGameplay
         }
     }
 
+#if false
     [HarmonyPatch(typeof(rstcalc), nameof(rstcalc.rstCalcSkillPowerUpCore))]
     [HarmonyPriority(Priority.First)]
     internal static class MutationCoreReplacementPatch
@@ -887,4 +970,5 @@ namespace NocturneModernGameplay
             }
         }
     }
+#endif
 }
