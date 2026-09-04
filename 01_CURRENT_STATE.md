@@ -319,11 +319,14 @@ Power-UpとMutationは別々に候補計算して比較する設計ではない�
   - `NocturneModernController.Settings.exe` = `b6808b38d54190d21d58a9687628546731a8a6195393b348fb3c184cc0440c15`
   - `NocturneModernController.Settings.dll` = `16ff899889dece0bb07e61c91a6633eed6ca71df31331567bdfbeb4380ed6cc8`
 
-### UNRESOLVED(実機未検証、次回最優先)
+### CONFIRMED(実機、2026-09-04追加)
 
-- Power-Up 100% / Mutation 100%で、未Power-Up→Power-Up、Power-Up済み→Mutation 100%となるか。
-- Power-Up 100% / Mutation Nativeで、未Power-UpはPower-Up優先、Power-Up済みはMutation Nativeとなるか。
-- Power-Up 0% / Mutation 100%でMutationのみ発生するか。
+- Power-Up 100% / Mutation 100%(Test E)で、bit6 clear→ordinary Power-Up、bit6 set→genuine Mutationとなることをunit=60の連続2試行(frame160086→197075)で確認した。詳細は下記「実機テストA〜E結果」参照。
+- Power-Up 100% / Mutation Native(Test A)で、bit6 clearユニット(unit=60)は5/5全試行でordinary Power-Up成立、Core到達欠落なしを確認した。詳細は下記参照。
+
+### UNRESOLVED(実機未検証)
+
+- Power-Up 0% / Mutation 100%でMutationのみ発生するか(今回のTest A〜Eでは未検証)。
 - ModernController GUIで両Chanceが0%/通常/100%として表示・保存・反映されるか。
 - ModernController無しで`NocturneModernGameplay.settings.json`のみで動作するか。
 
@@ -362,38 +365,92 @@ Power-UpとMutationは別々に候補計算して比較する設計ではない�
 
 **一般化ガード**: 本項のCONFIRMED/STRONGLY SUPPORTEDは、unit=60(Frost)の同一save上の2試行というobserved pathに基づく。「`SkillPowerUp.Always`は常にCore-entryを保証しない」という一般則自体は、他個体・他レベル・他save条件での反例探索を経てから確定表現へ格上げする。
 
-### 追加static finding: `Mutation.Disabled`のdil==1経路によるbit6バイパス(2026-09-04)
+### `Mutation.Disabled`のdil==1経路によるbit6バイパス(2026-09-04 static発見、2026-09-04 runtime確認)
 
-- CONFIRMED(static disassembly、`.analysis/disasm_mutation_disabled_bit6.py`)、**runtime未確認**: `rstCalcSkillPowerUpCore`のRNG-bypass経路(native `dil=1`、VA `0x18227E344`→`0x18227E347`の`jmp 0x18227E4BC`)は、bit6 test(`0x18227E40C`)を一切経由せずmerge block(`0x18227E4BC`/`0x18227E4BF`)へ到達する。`SkillMutation.Chance=Disabled`の既存パッチ(DEntry2、VA`0x18227E4BF`)がこの分岐をNOP化しているため、bit6の実際の状態(SET/CLEARいずれでも)に関わらず、この経路を通った回はordinary Power-Up成立処理(`0x18227E4C1`: `bit6|=0x40; return 1`)へ到達し得る。
+- CONFIRMED(static disassembly、`.analysis/disasm_mutation_disabled_bit6.py`): `rstCalcSkillPowerUpCore`のRNG-bypass経路(native `dil=1`、VA `0x18227E344`→`0x18227E347`の`jmp 0x18227E4BC`)は、bit6 test(`0x18227E40C`)を一切経由せずmerge block(`0x18227E4BC`/`0x18227E4BF`)へ到達する。`SkillMutation.Chance=Disabled`の既存パッチ(DEntry2、VA`0x18227E4BF`)がこの分岐をNOP化しているため、bit6の実際の状態(SET/CLEARいずれでも)に関わらず、この経路を通った回はordinary Power-Up成立処理(`0x18227E4C1`: `bit6|=0x40; return 1`)へ到達し得る。
+- **CONFIRMED runtime(2026-09-04、実機テストC)**: `bit6WasSetBeforeCore=True`の状態で`originalResult=1`が実際に発生し、`MutationDisabledBit6Guard`が`correctedResult=0 / corrected=True`へ補正したことを直接観測した(unit=59, frame=58062, 16:40:26.190)。
+- **STRONGLY SUPPORTED / runtime corroborated**: このruntime事象がstatic CFGで特定したdil=1 RNG-bypass経路に対応すること。確認済みstatic CFG上では、bit6 SET状態から`originalResult=1`へ到達する他経路は確認されていない。ただしdilレジスタ/branch自体はruntime直接観測していない。詳細は下記「実機テストA〜E結果」のTest C参照。
 - この現象は`SkillPowerUp.Chance`の設定値に非依存(`Mutation.Chance=Disabled`が有効である限り発生し得る)。
-- **Repeat=Nativeが実際に破られるか(bit6 SET済みユニットでこの経路経由の再Power-Upがruntimeで実際に観測されるか)は、guard発火または再Power-Upのruntime観測までCONFIRMEDへ昇格しない。**
 
-### Shared Outer Gate 実装チェックポイント(2026-09-04、PC shutdown保全のためのcommit。runtime検証は未実施)
+### Shared Outer Gate 実装チェックポイント(2026-09-04実装、2026-09-04実機テストA〜E完了)
 
-**実装済み(static / build-time CONFIRMED、runtime未検証)**:
+**実装済み(static / build-time CONFIRMED、実機テストA〜Eでruntime検証済み)**:
 
 - `src/SkillMutationV3/SharedSkillChangeOuterGateControl.cs`(新規): `0x18227EFD0`の単一owner。`forcePass = SkillMutationChanceControl.Mode==Always || SkillPowerUpChanceControl.Mode==Always`。`SkillMutationChanceControl`から`OuterGate`のSite定義を完全に除去済み(このVAへの二重書き込み経路は物理的に存在しない)。
 - `src/SkillMutationV3/MutationDisabledBit6Guard.cs`(新規): 上記`Mutation.Disabled`のbit6バイパス問題に対する是正。`rstCalcSkillPowerUpCore`のPrefixでCore進入前のbit6を捕捉し、Postfixで`SkillMutationChanceControl.Mode==Disabled && bit6WasSetBeforeCore==true && __result==1`のときのみ`__result=0`へ補正する。`__result`以外への書き込みなし。
 - 両`ChanceControl`の`SetMode`に、`SharedSkillChangeOuterGateControl.IsResolved==false`のとき`Always`遷移を拒否するfail-safeガードを追加(`Mode`を変更しない、partial Always状態を作らない)。
 - `ModMain.cs`の初期化順序を`SharedSkillChangeOuterGateControl.Initialize()` → `SkillMutationChanceControl.Initialize()` → `SkillPowerUpChanceControl.Initialize()`へ変更。
 - Clean build(error 0)・deploy・SHA256一致確認済み: `4085523e20d245556d91bce5c40543687077e9d1b0bf759f06a4985f281c88e6`。
+- **実機テストA〜E(2026-09-04)完了、全PASS。** 詳細は下記「実機テストA〜E結果」参照。
 
-**UNRESOLVED(実機未検証、次回再開時の最優先)**:
+**残存UNRESOLVED**:
 
-- 実機テストA〜E(下記NEXT参照)は**未実施**。この実装が意図通り動作することは、いずれのケースもまだruntimeで確認されていない。
-- `0x18227EFD0`がpre-Coreの確率ゲートであることは引き続きSTRONGLY SUPPORTEDのまま(CONFIRMEDへ未昇格)。今回の実装はこの前提に基づくが、実装自体の正しさとは独立に、この前提自体もまだruntime AL直接観測では裏付けられていない。
-- `MutationDisabledBit6Guard`が実際にnative `dil=1`を引いた試行で発火・補正することは、上記「追加static finding」の通りruntime未確認。
+- `0x18227EFD0`がpre-Coreの確率ゲートであることは引き続きSTRONGLY SUPPORTEDのまま(CONFIRMEDへ未昇格)。今回の実機テストでもAL直接runtime観測は行っていない。
+- native bit6 CLEAR siteの通常プレイでの発火タイミング(新規、下記参照。旧「bit6 persistence inconsistency」はTest A/Eのreload手順差によるconfoundと判明したため撤回・再定義済み)。
+- seqCurrent=9の意味論(新規、下記参照)。
+
+### 実機テストA〜E結果(2026-09-04、Shared Outer Gate / MutationDisabledBit6Guard検証)
+
+ログ出典: MelonLoader `Latest.log`(2026-09-04 16:33:25〜16:59:20)、`PowerUpMutationCfgDiagnostics`対象unit=59/60。モード切替ログを境界に5フェーズへ機械的に切り分けた。
+
+#### CONFIRMED runtime
+
+- **Test A**(Mutation=Native/PowerUp=Always): outer gate `forcePass=True bytes=A8 00`。10/10試行でCore到達(不発ゼロ)。bit6 clearユニット(unit=60)は5/5全試行でordinary Power-Up成立(Always priority conversion経由)。bit6 SETユニット(unit=59)は設計通り結果を尊重(4回不発+1回genuine Mutation、RNG-bypass経路由来)。
+- **Test B**(Mutation=Disabled/PowerUp=Always、bit6 clear): unit=60, frame=59017。Core到達、native自身がresult=1(補正不要、corrected=False)、bit6が正しくSET(flagRaw 0x3→0x43)。ordinary Power-Up成立。
+- **Test C**(bit6 SET、Mutation=Disabled/PowerUp=Always、Repeat=Native): 2種の経路をruntimeで直接確認。
+  - unit=60(Bから継続、frame=113154、約6分後): bit6 SET→native自身が`return 0`(通常のbit6 testルート、dil=0側)、再Power-Up不成立。
+  - unit=59(同フェーズ、frame=58062): `MutationDisabledBit6Guard; bit6WasSetBeforeCore=True originalResult=1 correctedResult=0 corrected=True`。RNG-bypass経路がbit6無視で`originalResult=1`を返し、Guardが`0`へ補正したことをruntimeで確認。dilレジスタ自体は非観測。
+- **Test D**(Mutation=Always/PowerUp=Native): 6/6試行(unit=59×3, unit=60×3)全てcoreResult=2。bit6状態(unit59=常時SET、unit60=常時CLEAR)に非依存でMutation成立、回帰なし。
+- **Test E**(Mutation=Always/PowerUp=Always、reloadなし・同一個体継続): unit=60の連続2試行(frame160086→197075、約4.5分間隔)で「bit6 clear→ordinary Power-Up(Always priority適用、restoredSkillId=299)→bit6 set→genuine Mutation(coreResult=2)」の順序をruntimeで直接確認。unit=59(bit6常時SET)も同フェーズでMutation尊重を確認。
+- **Test E由来の確定事実**: reloadなし・同一unit継続の条件下で、ordinary Power-Up成立によりSETされたbit6が、次回level-up(約4.5分後)まで保持されることを観測した(inv21→inv22)。
+- Shared Outer Gateのforce論理(`forcePass = mutationMode==Always || powerUpMode==Always`)は全21回のモード遷移ログで一致、二重書き込み経路なし。
+
+#### REJECTED / TEST-PROCEDURE CONFOUND(2026-09-04、ユーザー指摘により訂正)
+
+- **Test AとTest Eのbit6 persistence比較**: Test Aはユーザーが同一saveを試行ごとにreloadして複数回実施しており、Test Eはreloadせず同一個体を連続level-upさせていた。この手順差により、Test Aの各試行間でbit6がFalseに見えたのは「native CLEARが発火した」ためではなく、「Power-Up前のsave状態(bit6 clear)がreloadで復元された」ことで説明可能であり、unit lifetimeを跨いだnative CLEAR挙動の直接比較には使えない。旧記載の「bit6 persistence inconsistency」(Test A/E比較に基づくUNRESOLVED)は撤回する。
+
+#### UNRESOLVED(新規、2026-09-04)
+
+- **native bit6 CLEAR siteの通常プレイでの発火タイミング**(Test A/E比較とは切り離した別件): `rstUpdateSeqSkillPowerUp`内のbit6 CLEAR機構(Flag∈{3,4}×State+0x1C==1条件、VA `0x18228CCB2`/`0x18228CD89`)が実際のゲームプレイ中いつ発火するかは、reload混在のTest Aデータでは検証できていない。reloadなし条件での複数試行によるnative CLEAR発火の直接観測が必要。Repeat=Unlimited設計に影響し得るため引き続き優先調査。
+- **seqCurrent=9の意味論**: 今回のTest A〜E全22 invocationで、`rstCalcSkillPowerUpCore`呼び出し時の`GBWK.SeqInfo.Current`は例外なく`9`だった。既存のseq dispatch table記載(`seq10→rstUpdateSeqSkillPowerUp`)との関係(rstCalc内Core呼び出しとrstUpdate側seq遷移の時系列関係)は未整理。
+
+### 実機診断: reloadなし5 level-up観測(2026-09-04、SkillMutation.Chance=Native / SkillPowerUp.Chance=Always、EXP×10診断helper使用)
+
+ログ出典: 同日のMelonLoader `Latest.log`(18:03:38.989〜18:08:44.533、対象unit=59/60)。reloadを挟まずFrost(unit=60)を連続level-upさせた回。EXP-MULTIPLIERログは戦闘機会の時系列特定にのみ使用し、bit6/State意味論の根拠としては使用していない。
+
+#### CONFIRMED static
+
+- `State_182e31630+0x1C`は、この観測全体を通じて常に同一の固定static slot address(`0x182e31630`)である(unit・invocationを問わず同一アドレス)。
+
+#### CONFIRMED runtime
+
+- **State+0x1C cross-unit overwrite**: unit=60でState+0x1C=1を観測した後(frame=29722)、unit=59のCore呼び出し(frame=33720、coreResult=0)が発生し、既知writer(`rstcalc.rstCalc`内`0x18227F012`)がState+0x1C=0を書き込んだ。次にunit=60を観測した時点(frame=34262)ではState+0x1C=0になっていた。この間、target unit(59/60)のbit6はいずれも一貫してSETのままで、Site2(bit6 clearを伴うリセット、VA`0x18228CD89`/`0x18228CDAA`)は発火していない。
+  - **一般化ガード**: これは1 observed pathである。「すべてのunit・すべてのケースで必ずこの意味(=他unitに上書きされる)になる」とは一般化しない。今回確認できたのは、少なくとも1回、unit=59のCore呼び出しがunit=60の残していたState+0x1C値を上書きした、という事実のみである。
+- reloadなし・unit=60・6 Core invocations(observed path)でV3-BIT6-CLEARは0件(前回記録と同一区間の再確認)。
+
+#### REJECTED
+
+- 旧仮説「State+0x1Cを0へ戻す未知の別writerが存在する可能性が高い」は撤回する。理由: 今回の1→0遷移は、既知writer(`0x18227F012`)+別unit(59)のCore呼び出し(coreResult=0)だけで完全に説明でき、新規・未知のwriterを仮定する必要がない。
+- 「diagnostic上の重複(dedup bug)」「pCurrentStock誤帰属」「単一level-up内での近接重複Core呼び出し」は、6 Core invocationsと5 user-perceived level-upsの差分の説明としていずれも棄却する。6サイクルは27〜59秒間隔で明確に時間分離しており、`V3-CFG-CORE`は全件`pCurrentStockId=60`を一貫して報告し、`RstCalcState1CDiagnostics`のdedupキーは`seq`を含むため取りこぼしによる重複生成は起こり得ない。
+
+#### UNRESOLVED
+
+- **5 user-perceived level-ups vs 6 unit=60 Core invocations**: 原因未確定。以下2つがHYPOTHESISとして残るが、いずれも確定させない。
+  - user count漏れ(6サイクルのうち1件をユーザーがカウントし損ねた)。
+  - cycle4(frame=43495起点、seq6→8→**21→22**というforget-skill経路。他5サイクルのseq6→8→10→11→13という通常power-up経路と異なる)が、他5サイクルと異なる意味を持つ(=ユーザーが「level up」として認識した事象と一致しない可能性)。
+- native bit6 CLEAR siteの通常プレイでの発火タイミング(継続、未観測のまま)。
+
+#### Repeat=Unlimited設計への注意(重要な設計制約)
+
+- **State+0x1C(`State_182e31630+0x1C`)はunit-localなrepeat履歴値として直接利用してはならない。** 別unitのCore呼び出しによって上書きされる共有(グローバル)stateであることがCONFIRMED runtimeで確認されたため、特定unitのPower-Up成立履歴判定にState+0x1C単独では使えない。Repeat=Unlimitedの設計では、unit固有の履歴はpCurrentStock自体の状態(bit6等)から判定し、State+0x1Cをunit識別の代替に使わないこと。
 
 ### NEXT
 
-1. **実機テストA〜E(最優先、未実施)**:
-   - A: `Mutation=Native / PowerUp=Always`、bit6 clear、Frost同一saveで複数回 → 毎回Core到達・毎回ordinary Power-Up成立を期待。
-   - B: `Mutation=Disabled / PowerUp=Always`、bit6 clear → ordinary Power-Up成立を期待。
-   - C: 同一個体をbit6 SET後にもう一度level-up、`Mutation=Disabled / PowerUp=Always / Repeat=Native` → ordinary Power-Up再成立なしを期待。`MutationDisabledBit6Guard`の`bit6WasSetBeforeCore=true, originalResult=1, correctedResult=0`が観測できればBlocking Issue #1のruntime裏付けとなる。
-   - D: `Mutation=Always / PowerUp=Native` → 既存Mutation.Always回帰確認。
-   - E: `Mutation=Always / PowerUp=Always`、Repeat=Nativeで bit6 clear→Power-Up優先・bit6 set→Mutation を確認。
-2. `[SkillPowerUp] Repeat = Unlimited`をzero-baseで別investigationとして開始する。目標: Power-Upのみ繰り返し可能にし、Mutation.Chanceへ副作用を出さない。VEH/hardware breakpoint常駐、code caveのいずれも正式機能としては現時点で不採用方針を維持し、安全なnative制御点を再調査する。
-3. Repeat=Unlimited実装後のみ、Power-Up 100%⇔Mutation 100%の自動排他制御(最後に変更した側を優先し反対側を0%へ)を追加する。Repeat=Nativeでは両方100%の共存を許可し続ける。
+1. 5 user level-ups / 6 Core cyclesの差分整理、特にcycle4(seq21→22のforget-skill経路)の意味整理。**Repeat=Unlimited設計そのものへの直接的な必須条件ではない**(Repeat=Unlimitedが必要とするのはbit6 CLEAR条件とState+0x1Cの意味論であり、user側のカウント精度はそれ自体を左右しない)が、今後のobserved path解釈の信頼性(「何サイクル観測できたか」の正確な把握)に関わるため優先度1とする。
+2. native bit6 CLEAR siteの通常プレイでの発火タイミング調査(`rstUpdateSeqSkillPowerUp`のFlag値・State+0x1C挙動を試行単位でログ化する。reloadを挟まない複数試行で行い、Test Aで生じたreload confoundを再発させない)。
+3. seqCurrent=9とseq dispatch table(seq8/10/21/22)の時系列関係の追加cross-validation(observed pathを増やす)。
+4. `[SkillPowerUp] Repeat = Unlimited`をzero-baseで別investigationとして開始する。目標: Power-Upのみ繰り返し可能にし、Mutation.Chanceへ副作用を出さない。VEH/hardware breakpoint常駐、code caveのいずれも正式機能としては現時点で不採用方針を維持し、安全なnative制御点を再調査する。**State+0x1Cはunit-local判定に使わない(上記設計制約参照)。**
+5. Repeat=Unlimited実装後のみ、Power-Up 100%⇔Mutation 100%の自動排他制御(最後に変更した側を優先し反対側を0%へ)を追加する。Repeat=Nativeでは両方100%の共存を許可し続ける。
 
 ## Phase B: Repeat=Unlimited / Acquisition Mode 解析(実装前、zero-base)
 
