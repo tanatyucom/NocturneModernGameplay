@@ -548,6 +548,26 @@ Phase Bの調査(R0-A/R0-B/R0-Cのnative CFG、`investigations/REPEAT_UNLIMITED/
 - **未検証**: Continue/resume-from-suspend経由のLoad(静的解析では`slContinueYesNoProc`→`slLoadData`直接callという別経路の可能性が高く、`slLoadProc_closeFile`を通らない可能性がある)、New Game、複数ゲームセッション(プロセス再起動)をまたぐLoad、gameplayを挟まない連続Load。
 - 「1 Load = 1 marker」は上記検証範囲内でのCONFIRMED runtimeであり、あらゆるLoad経路への一般化ではない。
 
+## Hidden New Skill Entry(master-archive.md Section 22継続、2026-09-13〜14)
+
+`investigations/HIDDEN_SKILL_ENTRY/PLAN.md`に詳細を移した(調査経緯はそちらを参照。ここには今後の設計判断に必要な確定事項のみ記載)。
+
+### CONFIRMED
+
+- `cmpDrawSkillList`/`cmpSkillNameCostDraw`/`cmpMisc.cmpMakeStrCol`はforget UIの描画経路ではない(Harmony patch適用済み・seqゲート無し無条件カウンタでも0件、実機目視でリスト表示は確認済み)。旧来の「native "cmp" static関数がpresentationを担う」という前提はREJECTED。
+- 実描画は Unity側の `statusUI` MonoBehaviour(Assembly-CSharp, global namespace、GameObject `Canvas_UI/campUIBase/statusUI(Clone)`)が担っている。`TextMeshProUGUI[] obtainedText` / `GameObject[] skillCurObj`(16要素)等のフィールドを持つ。
+- `skillCurObj[i].activeSelf`は`obtainedText[i]`の`<material="TMC21">`タグと完全に相関する(21サンプル中不一致ゼロ)。選択ハイライトの実体としてSTRONGLY SUPPORTED。
+- フロストの forget フロー中、Learn-As-Newで習得したスキルの表示に差し替えられた行(`obtainedText[7]`)だけ、観測された全サンプルで`skillCurObj[7].activeSelf`が一度も`True`にならなかった。ユーザーの実機目視確認(「ハイライト枠は見えない」)と一致。**master-archive.md Section 22の現象がV3 zero-base移行後も再現することが確定した。**
+- **モデル修正**: 「所持8スキルとは別の9番目の特殊スロット」という前提は誤り。実際は通常8行(`obtainedText[0..7]`)のうち1行が、bridgeフロー中にpending/new skill表示へcontent差し替えされているだけである。
+- `statusUI`自身のIL2CPPメタデータ上のmanagedメソッドは`Awake`/`OnDisable`/`.ctor`の3つのみ。`obtainedText[i]`差し替えや`skillCurObj[i]`のON/OFFは別クラスが外部からpublicフィールドを直接操作して行っている。
+
+### UNRESOLVED
+
+- `skillCurObj[i]`を実際にset(`GameObject.SetActive`)している外部クラス・メソッドが未特定(`SkillCurObjSetActiveTrace.cs`によるevent-driven traceを実装・deploy済み、実機テスト待ち)。
+- 「差し替え行だけ漏れる」正確な原因は未特定(仮説段階)。
+
+### READY FOR PRODUCTION: NO(調査継続中、修正実装なし)
+
 ## 既知の別issue(記録のみ、本investigation対象外)
 
 ### Settings GUI経由のSkillPowerUp/SkillMutation Chance設定が意図せずNativeへ戻る事象(2026-09-12観測)

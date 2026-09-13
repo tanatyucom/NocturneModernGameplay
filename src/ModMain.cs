@@ -37,6 +37,11 @@ namespace NocturneModernGameplay
             GameplayFeatureRegistry.Initialize();
             GuiMetadataBridge.WriteSnapshot();
             GetDefaultSkillCallBoundaryTrace.LogPatchStatus();
+            SkillDrawListEntryTrace.LogPatchStatus();
+            SkillNameCostDrawFieldTrace.LogPatchStatus();
+            SkillCurObjSetActiveTrace.LogPatchStatus();
+            SkillMakeStrColFieldTrace.LogPatchStatus();
+            CmpMenuCursorTrace.LogPatchStatus();
             LoggerInstance.Msg(
                 "[NocturneModernGameplay] Loaded standalone; " +
                 "GUI metadata bridge is optional.");
@@ -57,11 +62,15 @@ namespace NocturneModernGameplay
             }
             GuiMetadataBridge.SampleToggleRequests();
             GameplayFeatureRegistry.Sample();
+            StatusUiFieldOffsetProbe.TryProbe();
+            SkillCurObjNativeCallerProbe.Tick();
+            SkillCurObjNativeCallerProbe.FlushPendingLogs();
         }
 
         public override void OnDeinitializeMelon()
         {
             PowerUpMutationBit6RawProbe.Uninstall();
+            SkillCurObjNativeCallerProbe.Uninstall();
             SkillCntWriterCaptureProbe.Uninstall();
             EventParamWriterCaptureProbe.Uninstall();
             GameplayFeatureRegistry.Shutdown();

@@ -63,30 +63,32 @@ fail closedとし、推測したアドレスへアクセスしない。
 
 ## AI Role Separation
 
+(2026-09-13更新、User承認済み)
+
 ### ChatGPT
 
 - coordinator
+- 全体のEvidence整理、矛盾チェック
 - runtime log analysis
 - visible / invisible差分抽出
-- Evidence整理
-- Claude結果のcross-check
+- 次の調査方針提案
+- Canonical判断のとりまとめ
 
 ### Claude
 
-- native reverse engineering
-- CFG
-- writer / reader追跡
-- native意味論
+- native reverse engineering / CFG / writer・reader追跡 / native意味論
+- read-only trace等の実装
+- clean build(`bin`/`obj`削除 → `dotnet build`)
+- Modsフォルダへのdeploy、SHA-256検証
+- production候補が完成するまで、上記を1セッション内で通しで実施してよい(実機テスト直前まで)
+- git add / commit / push等の破壊的操作は行わない(Git Guardrails継続適用)
 
 ### Codex
 
-- implementation
-- grep / search
-- diff
-- build
-- deploy
-- SHA-256検証
-- 機械的抽出
+- release / publication / final packaging主担当
+- 配布物作成、GitHub/Nexus/GameBanana向け作業
+- release/tag
+- 実装のfinal整理(Claude実装分の重複作業ではなく、公開前の最終整理)
 
 ### User
 
