@@ -34,6 +34,7 @@ namespace NocturneModernGameplay
     internal static class GameplayFeatureRegistry
     {
         private static readonly string[] ChanceAllowedValues = { "Disabled", "Native", "Always" };
+        private static readonly string[] RepeatAllowedValues = { "Native", "Unlimited" };
 
         private static readonly Dictionary<string, GameplayFeature> Features =
             new(StringComparer.OrdinalIgnoreCase);
@@ -73,6 +74,35 @@ namespace NocturneModernGameplay
                 GameplaySettingsService.SkillPowerUpChance,
                 GameplaySettingsService.SetSkillPowerUpChance,
                 SkillPowerUpChanceControl.Shutdown);
+            RegisterRepeatFeature();
+        }
+
+        // Repeat routes through GameplaySettingsService.SetRepeat (NOT
+        // through any ChanceControl.SetMode) - OptionFRepeatUnlimitedControl
+        // reads GameplaySettingsService.Repeat directly on every Core
+        // invocation (investigations/REPEAT_UNLIMITED/PLAN.md), so there is
+        // no separate runtime "mode" object to notify here, unlike Chance.
+        // Uses its own small registration (not RegisterChanceFeature, which
+        // is typed for the 3-value NativeChanceMode enum) since Repeat's
+        // values are a plain 2-value string set with no Disabled state.
+        private static void RegisterRepeatFeature()
+        {
+            const string id = "skill_powerup_repeat";
+            Features[id] = new GameplayFeature
+            {
+                Id = id,
+                Name = "Skill Power-Up: Repeat",
+                Description = "Skill Power-Upのbit6ゲート(「このサイクルは既にPower-Up済み」)による" +
+                              "不成立を、通常成功へ変換するかどうかです。通常 = native挙動のまま、" +
+                              "無制限 = R0-C(bit6ゲート由来の不成立)のみ通常成功へ変換します" +
+                              "(native除外〈R0-B〉・候補なし〈R0-A〉は変換しません)。",
+                Category = "Gameplay Change",
+                SortOrder = 91,
+                AllowedValues = RepeatAllowedValues,
+                Value = GameplaySettingsService.Repeat,
+                Enabled = true,
+                SetValue = raw => GameplaySettingsService.SetRepeat(raw)
+            };
         }
 
         private static void RegisterChanceFeature(

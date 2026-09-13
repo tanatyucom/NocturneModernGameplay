@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
+using MelonLoader;
 
 namespace NocturneModernGameplay
 {
@@ -102,14 +103,45 @@ namespace NocturneModernGameplay
                 {
                     return;
                 }
+                List<FeatureToggleRequest> ownRequests = requests
+                    .Where(item => string.Equals(item.ProviderId, ProviderId, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (ownRequests.Count == 0)
+                {
+                    return;
+                }
+
+                // SETTINGS-RELOAD diagnostic (Settings GUI Chance reset bug
+                // investigation, 2026-09-12): "source" is this provider's
+                // persistent record (GameplaySettingsService, which is
+                // also what NocturneModernGameplay.settings.json holds -
+                // see that class's own header comment) as it stood BEFORE
+                // this request batch is applied. "applied" is the same
+                // three values AFTER. A human comparing the two lines can
+                // immediately tell whether a GUI round-trip silently
+                // changed something the persistent record did not already
+                // reflect. Logged only when at least one request in this
+                // batch actually targets this provider - never per frame.
+                string sourceMutationChance = GameplaySettingsService.SkillMutationChance.ToString();
+                string sourcePowerUpChance = GameplaySettingsService.SkillPowerUpChance.ToString();
+                string sourceRepeat = GameplaySettingsService.Repeat;
+
                 bool changed = false;
-                foreach (FeatureToggleRequest request in requests.Where(item =>
-                             string.Equals(item.ProviderId, ProviderId, StringComparison.OrdinalIgnoreCase)))
+                foreach (FeatureToggleRequest request in ownRequests)
                 {
                     changed |= !string.IsNullOrEmpty(request.Value)
                         ? GameplayFeatureRegistry.TrySetValue(request.FeatureId, request.Value)
                         : GameplayFeatureRegistry.TrySetEnabled(request.FeatureId, request.Enabled);
                 }
+
+                MelonLogger.Msg(
+                    "[NocturneModernGameplay] SETTINGS-RELOAD; " +
+                    $"sourceMutationChance={sourceMutationChance}; sourcePowerUpChance={sourcePowerUpChance}; " +
+                    $"sourceRepeat={sourceRepeat}; " +
+                    $"appliedMutationChance={GameplaySettingsService.SkillMutationChance}; " +
+                    $"appliedPowerUpChance={GameplaySettingsService.SkillPowerUpChance}; " +
+                    $"appliedRepeat={GameplaySettingsService.Repeat}.");
+
                 if (changed)
                 {
                     WriteSnapshot();

@@ -203,6 +203,12 @@ Power-UpとMutationは別々に候補計算して比較する設計ではない�
 - RNG-success側では、bit6 SET → (`0x18227E410 jne`) → `return 0`。promotion-checkで`dil`が1へ昇格していても、bit6 SETならreturn 0となる(`dil`はbit6 testのSET分岐では参照されない)。
 - ordinary Power-Up成立時のみ、Core自身がbit6をSETする。
 
+#### bit6 gateとcandidate selectionの順序(2026-09-05追加、CONFIRMED static)
+
+- Core内部の呼び出し順序は、Core entry → `0x18227E15A`(`rstRndGetPowerUpSkill`呼び出し) → `GBWK.PUpSkillIndex` / `PUpSkillID`確定 → bit6 test(`0x18227E40C`)である。
+- bit6 SETによる`return 0`は、candidate selection**前**に落ちる経路ではない。candidate selection**後**、native candidateが既に確定した状態で、bit6 gateにより当該candidateごと破棄される経路である。
+- 詳細な設計上の含意(Repeat=Unlimited Option D/Fの評価根拠)は`investigations/REPEAT_UNLIMITED/PLAN.md`参照。
+
 #### runtime検証
 
 上記static CFGは、hardware breakpoint(4地点同時観測)によるruntime basic-block通過確認で検証済み。
@@ -503,3 +509,61 @@ Power-UpとMutationは別々に候補計算して比較する設計ではない�
   - seq `10` → `rstUpdateSeqSkillPowerUp`
   - seq `21` → `rstUpdateSeqDestroySkill`(VA `0x1822890D0`)
   - seq `22` → `rstUpdateSeqDestroyConfirm`(VA `0x182288B20`)
+
+## Phase C: Option F result conversion — 初回実機成功(2026-09-12)
+
+Phase Bの調査(R0-A/R0-B/R0-Cのnative CFG、`investigations/REPEAT_UNLIMITED/PLAN.md`)を前提に、人間承認を得てOption F result conversionの初回candidate実装(`src/SkillMutationV3/OptionFRepeatUnlimitedControl.cs`)を実施し、`SkillMutation.Chance=Native / SkillPowerUp.Chance=Always / SkillPowerUp.Repeat=Unlimited`の設定で実機投入した。**詳細な生ログ・disassembly根拠は`investigations/REPEAT_UNLIMITED/PLAN.md`「Option F result conversion 初回実機成功(2026-09-12)」を正とする。ここには今後の設計判断に必要な確定事項の要約のみを記載する。**
+
+### CONFIRMED runtime observed(2026-09-12、1セッション分)
+
+- R0-C(`rstCalcSkillPowerUpCore`のbit6ゲートによるrawResult==0)を`__result=1`(ordinary Power-Up成功相当)へ変換するOption Fの初回実機成功を2件観測した:
+  - `unit=59`(今回セッション上の対応: ハイピクシー)、`pUpSkillID=39:"メディア"`。
+  - `unit=60`(今回セッション上の対応: ジャックフロスト。ユーザー実機確認済み)、`pUpSkillID=16:"マハジオ"`。
+  - いずれも変換直前の`V3-OPTIONF-CANDIDATE-POOL`スナップショットで対象skillが未所持だったことを確認しており、既所持skillへの無意味な再変換ではない。
+- R0-B(native exclusion一致によるrawResult==0)がOption Fによって誤って変換されない保護を1件観測した: `unit=136`(今回セッション上の対応: モウリョウ)、`pUpSkillID=22:"マハザン"`、`action=NOT_CONVERTED`。
+- 上記3件は、`__result`を一切書き換えない独立診断(`OptionFF2Diagnostics`)側でも同一のnative raw classification(`rawResult=0`、対応する`exclusionMatched`値)が一致することを確認した。
+- **Option Fとは無関係のnative自身の挙動として**、ジャックフロスト(`unit=60`)で「既に`マハブフ`を所持した状態で`ブフ->マハブフ`のSkill Power-Upが成立し、`マハブフ`が2枠並ぶ」ことをユーザー実機目視で確認した(CONFIRMED runtime observed、この観測ケースについて)。少なくとも今回観測したジャックフロストのブフ→マハブフケースでは、target skillを既に所持していてもnative Skill Power-Upが成立し、同一skill IDの重複所持が発生した(「native Skill Power-Up全般が常に既所持targetを許可する」とは一般化しない)。このため**Option F側に独自のtarget既所持禁止guardは追加しない**(native semanticからの乖離を避けるため)。詳細は`investigations/REPEAT_UNLIMITED/PLAN.md`「Native Skill Power-Upの既所持target重複(2026-09-12)」参照。
+
+### UNRESOLVED / NOT YET CONFIRMED
+
+- production stability / universal correctness(観測件数が少なく、設定組み合わせも未網羅)。
+- `SkillMutation.Chance=Disabled`と`SkillPowerUp.Repeat=Unlimited`の共存(`MutationDisabledBit6Guard`との`__result`書き込み競合。Harmony postfix実行順序が未検証のため、現行candidateは`Mode==Disabled`時に防御的skipする設計。技術的に不可能とは断定していない)。
+- `unit=59`/`unit=60`/`unit=136`の仲魔対応(ハイピクシー/ジャックフロスト/モウリョウ)は今回のセッション上の観測にすぎず、`datUnitWork_s.id`の普遍的semanticとしては引き続きUNRESOLVED。
+
+### READY FOR PRODUCTION: NO
+
+## Diagnostics: SaveLoadDiagnostics(reload boundary marker)
+
+- 実装: `src/Diagnostics/SaveLoadDiagnostics.cs`(read-only diagnostic、GUI/settings.jsonなし、Gameplay機能未登録)。
+- Hook: `slMain.slLoadProc_closeFile`のHarmony Postfixを無条件発火させ、`V3-SAVE-LOAD; type=LoadComplete; frame=...`をログ出力する。
+
+### CONFIRMED runtime
+
+- 1セッション内でLoad-menuからのLoadを3回(タイトル画面から1回、field復帰後に2回)実行し、`type=LoadComplete`マーカーが3件(frame 1332 / 2097 / 3203)、1:1で観測された。
+- 同セッション内のSave-only操作1回では追加マーカー0件だった(false positiveなし)。
+
+### 検証範囲(重要、この診断を他investigationで再利用する際の前提)
+
+- **検証済み**: Load-menu Load 3/3一致、Save-only false positive 0/1。
+- **未検証**: Continue/resume-from-suspend経由のLoad(静的解析では`slContinueYesNoProc`→`slLoadData`直接callという別経路の可能性が高く、`slLoadProc_closeFile`を通らない可能性がある)、New Game、複数ゲームセッション(プロセス再起動)をまたぐLoad、gameplayを挟まない連続Load。
+- 「1 Load = 1 marker」は上記検証範囲内でのCONFIRMED runtimeであり、あらゆるLoad経路への一般化ではない。
+
+## 既知の別issue(記録のみ、本investigation対象外)
+
+### Settings GUI経由のSkillPowerUp/SkillMutation Chance設定が意図せずNativeへ戻る事象(2026-09-12観測)
+
+Skill Mutation V3 / Repeat=Unlimited investigation(R0-B調査)とは別issueとして、事実のみを記録する。今回は調査・修正を行わない。
+
+**観測事実(CONFIRMED runtime observed)**:
+- `NocturneModernGameplay.settings.json`で`SkillPowerUp.Chance=Always`を設定していた状態から、NocturneModernController側のSettings GUI(`NocturneModernController.Settings.exe`、ゲーム内Select長押しで起動)を開いて閉じた直後、ログに以下が出力された。
+  ```
+  Settings GUI closed; settings reloaded.
+  (約9秒後)
+  SkillMutationChanceControl mode set; mode=Native.
+  SkillPowerUpChanceControl mode set; mode=Native.
+  ```
+- この時点でディスク上の`NocturneModernGameplay.settings.json`は`SkillPowerUp.Chance="Always"`のまま変化していなかった(ファイル内容とruntime上のモードが乖離した)。
+
+**原因**: `HYPOTHESIS`(GUI load/save処理のbug等)。今回は原因追跡・修正のいずれも行っていない。
+
+**再現条件・影響範囲**: 未調査。

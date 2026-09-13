@@ -42,7 +42,28 @@ namespace NocturneModernGameplay
         // independent of the Chance control points and must never be a
         // prerequisite for them. Flip to true only for a deliberate,
         // explicit real-machine investigation session.
-        internal static bool Enabled = true;
+        //
+        // Was temporarily set to false for one session so
+        // SkillCntWriterCaptureProbe could use Dr0/Dr1 without conflicting
+        // with this probe's four execute breakpoints (Dr0-Dr3). That
+        // investigation (empty-slot AND full-capacity ownership-write
+        // instructions, both CONFIRMED) is done and
+        // SkillCntWriterCaptureProbe.Enabled is now false, so this is
+        // restored to its normal value. Never enable both probes at once -
+        // they share the same 4 hardware debug registers.
+        //
+        // Restored to true - EventParamWriterCaptureProbe caused a hard
+        // crash near a high-load scene transition (Hi-Pixie battle entry)
+        // and has been disabled (see its own Enabled comment). Do not
+        // disable this again for that probe until its arm window is
+        // narrowed and the crash cause is understood.
+        //
+        // HI-PIXIE STALL HEALTH CHECK: temporarily false anyway, alongside
+        // every other observer in this mod - this file's own header
+        // explicitly documents it as independent of [SkillMutation]/
+        // [SkillPowerUp] Chance behavior, so disabling it does not affect
+        // the AddNew bridge or Chance=Always functionality under test.
+        internal static bool Enabled = false;
 
         private const int TargetUnitA = 59;
         private const int TargetUnitB = 60;

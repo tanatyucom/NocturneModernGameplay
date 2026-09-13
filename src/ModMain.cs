@@ -36,6 +36,7 @@ namespace NocturneModernGameplay
             GameplaySettingsService.Load();
             GameplayFeatureRegistry.Initialize();
             GuiMetadataBridge.WriteSnapshot();
+            GetDefaultSkillCallBoundaryTrace.LogPatchStatus();
             LoggerInstance.Msg(
                 "[NocturneModernGameplay] Loaded standalone; " +
                 "GUI metadata bridge is optional.");
@@ -61,6 +62,8 @@ namespace NocturneModernGameplay
         public override void OnDeinitializeMelon()
         {
             PowerUpMutationBit6RawProbe.Uninstall();
+            SkillCntWriterCaptureProbe.Uninstall();
+            EventParamWriterCaptureProbe.Uninstall();
             GameplayFeatureRegistry.Shutdown();
         }
     }

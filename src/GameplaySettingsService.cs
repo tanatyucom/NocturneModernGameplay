@@ -48,10 +48,12 @@ namespace NocturneModernGameplay
         internal static NativeChanceMode SkillMutationChance { get; private set; } = NativeChanceMode.Native;
         internal static NativeChanceMode SkillPowerUpChance { get; private set; } = NativeChanceMode.Native;
 
-        // Phase A: Repeat has exactly one legal value (Native). Unlimited is
-        // parsed (so a hand-edited file naming it is recognized rather than
-        // treated as garbage) but never applied - there is no backend for
-        // it yet, and it must never silently no-op as if it worked.
+        // "Native" or "Unlimited". Unlimited's backend is
+        // OptionFRepeatUnlimitedControl (Option F result conversion,
+        // initial diagnostic-heavy candidate - see
+        // investigations/REPEAT_UNLIMITED/PLAN.md). Any other value falls
+        // back to Native with a warning, never silently no-ops as if it
+        // worked.
         internal static string Repeat { get; private set; } = "Native";
 
         private static string SettingsPath =>
@@ -96,14 +98,15 @@ namespace NocturneModernGameplay
 
             SkillMutationChanceControl.SetMode(SkillMutationChance);
             SkillPowerUpChanceControl.SetMode(SkillPowerUpChance);
-            // Repeat has no backend yet in Phase A - intentionally not
-            // applied anywhere; SkillPowerUpChanceControl's Always logic
-            // always behaves as Repeat=Native (see its own header comment).
+            // Repeat itself has no ApplyMode/SetMode step here - it is read
+            // directly from this service's Repeat property by
+            // OptionFRepeatUnlimitedControl on every Core invocation, so
+            // there is nothing additional to "apply" at load time.
 
             MelonLogger.Msg(
                 "[NocturneModernGameplay] Gameplay settings loaded; " +
                 $"SkillMutation.Chance={SkillMutationChance} SkillPowerUp.Chance={SkillPowerUpChance} " +
-                $"SkillPowerUp.Repeat={Repeat}(not yet implemented, no effect).");
+                $"SkillPowerUp.Repeat={Repeat}.");
         }
 
         internal static void Save()
@@ -148,6 +151,22 @@ namespace NocturneModernGameplay
             Save();
         }
 
+        // GUI entry point for SkillPowerUp.Repeat. Unlike Chance, there is
+        // no SetMode step here - OptionFRepeatUnlimitedControl reads
+        // GameplaySettingsService.Repeat directly on every Core invocation
+        // (see its own header comment), so updating this property is the
+        // entire "apply" step; Save() persists it immediately, matching the
+        // Chance setters' apply-then-persist pattern. Reuses ParseRepeat so
+        // an unexpected value can never be stored as anything other than
+        // "Native" or "Unlimited" (fails safe to Native with a warning,
+        // same as a malformed config file value).
+        internal static void SetRepeat(string mode)
+        {
+            Repeat = ParseRepeat(mode);
+            Save();
+            MelonLogger.Msg($"[NocturneModernGameplay] SkillPowerUp Repeat mode set; mode={Repeat}.");
+        }
+
         private static NativeChanceMode ParseChanceMode(string? raw, string fieldName)
         {
             if (Enum.TryParse(raw, ignoreCase: true, out NativeChanceMode mode))
@@ -160,13 +179,7 @@ namespace NocturneModernGameplay
         private static string ParseRepeat(string? raw)
         {
             if (string.Equals(raw, "Native", StringComparison.OrdinalIgnoreCase)) return "Native";
-            if (string.Equals(raw, "Unlimited", StringComparison.OrdinalIgnoreCase))
-            {
-                MelonLogger.Warning(
-                    "[NocturneModernGameplay] config: SkillPowerUp.Repeat=Unlimited is not yet implemented " +
-                    "in this build; falling back to Native (it will NOT silently behave as Unlimited).");
-                return "Native";
-            }
+            if (string.Equals(raw, "Unlimited", StringComparison.OrdinalIgnoreCase)) return "Unlimited";
             if (!string.IsNullOrEmpty(raw))
                 MelonLogger.Warning(
                     $"[NocturneModernGameplay] config: unknown SkillPowerUp.Repeat value '{raw}'; falling back to Native.");
