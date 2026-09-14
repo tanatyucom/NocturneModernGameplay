@@ -117,6 +117,28 @@ namespace NocturneModernGameplay
                 // pending; Frost's screenshot (curriculum exhausted) shows
                 // no such third column at all. This is now the primary
                 // suspect over skillCurObj[7].
+                // 2026-09-14: static disassembly of VA 0x1822DA3FB found a
+                // DEDICATED target==8 code path (separate from the
+                // ebx=0..7 highlight loop at VA 0x1822D97C0) that renders
+                // its own name/icon and calls cmpSetupObject(skillCurObj[8],
+                // true) - skillCurObj[8] (NOT part of the 0..7 obtained
+                // row loop above, which only ever indexes 0..obtainedText.
+                // Length-1) is that dedicated path's own highlight object.
+                // Logged unconditionally (not just when a hidden entry is
+                // suspected) so its full lifecycle - activeSelf through
+                // this same file's activeInHierarchy/alpha/geometry checks -
+                // can be correlated after the fact with whenever
+                // CursorPos.Shift/target actually equals 8.
+                {
+                    bool active8 = SafeActive(ui.skillCurObj, 8);
+                    bool inHierarchy8 = SafeActiveInHierarchy(ui.skillCurObj, 8);
+                    float alpha8 = SafeCanvasGroupAlpha(ui.skillCurObj, 8);
+                    string geom8 = GeometryDump(ui.skillCurObj, 8, null);
+                    sb.Append(
+                        $" | skillCurObj[8] active={active8} inHierarchy={inHierarchy8} " +
+                        $"alpha={alpha8:F2} {geom8}");
+                }
+
                 int nAwait = ui.awaitText?.Length ?? 0;
                 for (int i = 0; i < nAwait; i++)
                 {

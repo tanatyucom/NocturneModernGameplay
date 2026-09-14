@@ -63,14 +63,55 @@ namespace NocturneModernGameplay
             GuiMetadataBridge.SampleToggleRequests();
             GameplayFeatureRegistry.Sample();
             StatusUiFieldOffsetProbe.TryProbe();
-            SkillCurObjNativeCallerProbe.Tick();
-            SkillCurObjNativeCallerProbe.FlushPendingLogs();
+            SelectSkillIdOffsetProbe.TryProbe();
+            // SkillCurObjNativeCallerProbe / HighlightTargetGateTrace /
+            // CursorPosShiftWriteWatchTrace / SelectSkillIdWriteWatchTrace /
+            // Hidden9thSlotPathTrace .Tick()/FlushPendingLogs() are
+            // deliberately NOT called this session: all of these classes
+            // (plus Hidden9thGateCascadeTrace below) install hardware
+            // breakpoints on the same DR0-DR3 registers
+            // (InstallHardwareBreakpoint(s)OnCurrentThread unconditionally
+            // claims them), and running more than one at once would have
+            // the later Install() silently steal registers out from under
+            // the earlier one, breaking it without any error. All five
+            // already answered the question they were built for: caller
+            // converges on cmpSetupObject VA 0x182620A80; highlight gate's
+            // `target` is 8 while sitting on the hidden entry, one past
+            // loopUpper=8; CursorPos.Shift=8 is written unconditionally by
+            // native at VA 0x182288AC1 and conditionally by the AddNew
+            // bridge path at VA 0x182289313; GBWK.SelectSkillID's native
+            // writer search was abandoned as moot; and Hidden9thSlotPathTrace
+            // found the decisive asymmetry - High Pixie's AddNew-bridge
+            // case reaches AND completes the dedicated target==8 branch
+            // (skillCurObj[8] ends up active/inHierarchy=True), while
+            // Frost's AddNew-bridge case reaches the branch-entry
+            // breakpoint (VA 0x1822DA48C) ZERO times despite CursorPos.
+            // Shift staying 8 for its entire seq21/22 episode - see
+            // 01_CURRENT_STATE.md / investigations/HIDDEN_SKILL_ENTRY/
+            // PLAN.md, all CONFIRMED. Hidden9thGateCascadeTrace (below) is
+            // the active investigation now - it uses all 4 hardware
+            // breakpoint registers (DR0-DR3) as a ladder of real EXECUTE
+            // breakpoints at each gate's own fallthrough address (an
+            // earlier managed-context-replication design was tried and
+            // proven unreliable - see that file's own 2026-09-14
+            // correction note - one of the gates reads a highly volatile,
+            // frequently-reused shared value that a same-frame
+            // out-of-band read cannot trust). Uninstall() below still runs
+            // for all of them so any leftover state from a prior build is
+            // cleaned up.
+            Hidden9thGateCascadeTrace.Tick();
+            Hidden9thGateCascadeTrace.FlushPendingLogs();
         }
 
         public override void OnDeinitializeMelon()
         {
             PowerUpMutationBit6RawProbe.Uninstall();
             SkillCurObjNativeCallerProbe.Uninstall();
+            HighlightTargetGateTrace.Uninstall();
+            CursorPosShiftWriteWatchTrace.Uninstall();
+            SelectSkillIdWriteWatchTrace.Uninstall();
+            Hidden9thSlotPathTrace.Uninstall();
+            Hidden9thGateCascadeTrace.Uninstall();
             SkillCntWriterCaptureProbe.Uninstall();
             EventParamWriterCaptureProbe.Uninstall();
             GameplayFeatureRegistry.Shutdown();

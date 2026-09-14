@@ -174,19 +174,108 @@ vtable総当たりではなく、`PowerUpMutationBit6RawProbe.cs`と同じhardwa
 
 `cmpUpdate`クラスは`cmpDrawStatus`/`cmpStatus`(描画チェーン)とは別の、入力/カーソルロジック系クラス。関連メソッド: `cmpMenuCursor`、`cmpSetupObject`、`cmpUpdateSkillSelect`(スキル選択UIの更新本体と推定、未解析)。
 
-## UNRESOLVED
+## REJECTED(2026-09-14、上記`cmpMenuCursor`本命説)
 
-- hidden entry選択時、実際に`cmpMenuCursor`へ渡される`idx`と`CursorList.Length`の具体的な値(まだ実測していない — 今回のヒットはindex=8の通常blink、hidden entry状態そのものではなかった可能性がある)。
-- `cmpUpdateSkillSelect`が`cmpMenuCursor`をどう呼んでいるか(呼び出し元での`idx`/`CursorList`の決定ロジック)は未解析。
-- `awaitObj`/`await2Obj`経由のケース(息吹の具足)と、`obtainedText[7]`直接差し替えのケース(会心)が、実際に同じ根本原因で説明できるかは未検証。
+`cmpMenuCursor`(VA `0x1826207F0`)を「ハイライトON呼び出しの本命候補」として追っていたが、User指摘により再検証した結果REJECTEDとなった。`SkillCurObjNativeCallerProbe`(当時: `GameObject.SetActive`自身の入口にhardware breakpoint)が捕捉していた`returnAddress=0x182620AFD`は、`.analysis/disasm_cmpmenucursor_0x1826207f0.py`での再逆アセンブルの結果、`cmpMenuCursor`の範囲外(`cmpMenuCursor`自体は`0x18262089F`の`ret`で終了)であり、実際には別関数`cmpUpdate.cmpSetupObject`(VA `0x182620A80`)内、`call 0x182842eb0`(=本物の`GameObject.SetActive`)の直後の命令だったと判明した。`cmpSetupObject`は`GameObject.SetActive`の薄いラッパー(現在値と希望値が同じならno-op)であり、`GameObject.SetActive`自身の入口にbreakpointを置く限り、捕捉できる呼び出し元は常に`cmpSetupObject`1箇所に収束してしまう(1階層深い本当の呼び出し元は見えない)、という構造的な限界だったことが分かった。`cmpMenuCursor`が本当に無関係なのか、あるいは正しい経路の一部なのかは、この時点では未確定のまま次のステップへ進んだ。
+
+## CONFIRMED(2026-09-14、根本原因確定 — User承認済みCanonical State)
+
+`cmpSetupObject`(VA `0x182620A80`)自身の入口へbreakpointを移して(`SkillCurObjNativeCallerProbe.cs`改修)実機テストしたところ、通常行0〜7の`cmpSetupObject(true)`呼び出しが**全て同一の呼び出し元**(staticVa `0x1822D9C6B`)に収束することを確認した。この呼び出し元を含む関数(VA `0x1822D97C0`〜、`.analysis/disasm_0x1822d9c6b_context.py`/`disasm_0x1822d9c6b_funcstart.py`)を逆アセンブルした結果、以下のゲートを発見した(byte-exact確認済み):
+
+```
+0x1822D9AF3  movzx ecx, byte ptr [rax+0x14]   ; CursorPos.Shift
+0x1822D9AF7  movsx eax, word ptr [rax+0x12]   ; CursorPos.Index(sign-extend)
+0x1822D9AFB  add   ecx, eax                    ; target = Shift + Index
+0x1822D9AFD  cmp   ecx, ebx                     ; target vs ebx(このループ回で検討中の行)
+0x1822D9AFF  jne   <この行へのcmpSetupObject(true)呼び出しをスキップ>
+```
+
+`ebx`は`0`から`loopUpper`(`=[r15+0x48]`、実測`8`)未満までしか回らない。この`target == ebx`ゲートを`HighlightTargetGateTrace.cs`(`0x1822D9AFD`へのhardware breakpoint)で直接計測した結果、**hidden entry滞在中は`target=8; loopUpper=8; ebx=0〜7全てmatch=False`**を実機で確認した。同時刻の既存trace(`SkillCursorFieldTrace.cs`)も同一frameで`CursorPos.Index=0; CursorPos.Shift=8`(=`target`と完全一致)を独立に記録しており、さらに別の既存trace(`HIDDEN-SLOT-ARRAY-CHECK`)でも同一frameで`cursor=8`のとき`selectSkillID`が所持8スキル配列(`skill=[...]`、8要素)の外側の値(pending new skillのID)を指すことを確認した。
+
+**結論(CONFIRMED — static disassembly + 独立した2系統のruntime計測 + 実機症状が一致)**: hidden entry滞在時、`CursorPos.Index=0`/`CursorPos.Shift=8`、したがってハイライト判定用の`target`(`=Shift+Index`)は`8`になる。一方、ハイライト描画側ループは`ebx=0..7`(`loopUpper=8`)しか走らないため`target == ebx`が一度も成立せず、`cmpSetupObject(skillCurObj[ebx], true)`がどの行に対しても呼ばれない。その結果、論理選択・説明文表示・決定操作は機能するが、選択ハイライトだけが表示されない。
+
+### `CursorPos.Shift=8`のwriter(2026-09-14、CONFIRMED)
+
+`CursorPosShiftWriteWatchTrace.cs`(hardware write breakpoint、`CursorPos+0x14`監視)で実機捕捉した。
+
+- native自身のforget flow開始時(seq=8、bridgeActive=False): VA `0x182288AC1`(`mov byte ptr [rcx+0x14], 8`)で**無条件に**書き込まれる。直前に`call 0x1822eefa0`(`SkillCursorFieldTrace.cs`のコメントで既に「pure UI、副作用なし」と分類されていた関数)を呼んでいる。
+- AddNewブリッジ経路(seq=21、bridgeActive=True): 大きなdispatch関数(`cmpUpdateSkillSelect`と推定)内、VA `0x182289313`(`mov byte ptr [rax+0x14], 8`)で、入力方向コード(レジスタ`bx`)と別のレジスタ`dil`の値次第で**条件付きに**書き込まれる。同じ関数内に`Shift=0`へのリセット(VA `0x1822892DE`)、`Shift+=4`/`Shift-=4`の分岐も存在し、4刻みのページ送り/折り返しロジックの一部と見られる。
+- 通常のカーソル移動(0〜7の増減)は別のwriter(VA `0x1822EDE25`ほか)が担当し、こちらは`8`を一切生成しない。
+
+両経路とも「8」は偶然でも壊れた値でもなく、明示的に埋め込まれた定数である。
+
+### スコープ確定(2026-09-14、CONFIRMED、User訂正済み)
+
+nativeの通常Power-Upは上書き方式であるため、`Shift=8`の状態を「9番目の選択肢」としてプレイヤーに操作させる状況が発生しない。一方AddNewブリッジでは、その内部状態(`Shift=8`)をユーザー操作可能なUIまで持ち込んでしまうため、通常のハイライト描画ループ(`ebx=0..7`)との不整合が可視化される。**したがって本現象はAddNewブリッジ経路に固有**であり、native自身の`Shift=8`書き込みを「単なる初期化上の副産物」と断定することはまだしない(native側で実害のある可視状態に到達しないことまでがCONFIRMED)。
+
+### `SelectSkillID`の解決元(2026-09-14、訂正)
+
+`HIDDEN-SLOT-ARRAY-CHECK`で観測していた「cursor=8のときselectSkillIDがpending skillを指す」という挙動は、`AddNewHighlightCorrection.cs`(このMOD自身のコード)が`FullCapacityAddNewBridgeState.Active`時のみ行っている補正であり、native自身の挙動として確認されたものではなかった。native自身がcursor=8時に`SelectSkillID`をどう扱うかは、上記スコープ確定によりそもそも調査不要と判断した(nativeの通常経路ではcursor=8がプレイヤー操作可能な状態まで到達しないため)。
+
+`GBWK.SelectSkillID`の生オフセットは`SelectSkillIdOffsetProbe.cs`(値一致スキャン、5サンプルで収束)により`GBWK+0x9C`とCONFIRMED。`SelectSkillIdWriteWatchTrace.cs`(hardware write breakpoint)も実装済みだが、上記の理由により今回のnative側テストでは意味がないと判断し、実機データは未取得。
+
+### 未解決の重要な手がかり(2026-09-14、次の本命)
+
+`SkillCurObjNativeCallerProbe`の実機ログで、通常行0〜7の`cmpSetupObject(true)`呼び出しは全て`0x1822D9C6B`に収束する一方、**index=8だけは別のcaller(`0x1822DA5FB`)から`value=True`が観測された**(前回セッション、`SKILLCUROBJ-NATIVE-CALLER-HIT; index=8; ... staticVa=0x1822DA5FB`)。ゲーム側に「9番目/pending用の別表示経路」が本来存在する可能性があり、次の調査対象。この経路が
+
+- `Shift==8`を条件にしているか
+- await/pending state(`awaitObj`/`await2Obj`)を参照しているか
+- `skillCurObj[8]`を何の条件でONにするか
+
+を静的解析で特定できれば、MOD側で`skillCurObj[7]`等を無理やり光らせるのではなく、**ゲームが本来持つ9番目/pending用表示経路をAddNewブリッジから正しく使う**修正が可能になる。
+
+## UNRESOLVED(旧、2026-09-14以前・参考記録)
+
+- `cmpUpdateSkillSelect`が`cmpMenuCursor`をどう呼んでいるか(呼び出し元での`idx`/`CursorList`の決定ロジック)は未解析(上記REJECTEDの通り、`cmpMenuCursor`自体が本命かどうかは未確定のまま保留)。
 - ダツエバでの検証結果(未実施)。
+
+## CONFIRMED(2026-09-14、High Pixie成功ケース vs Frost失敗ケース比較)
+
+`0x1822DA5FB`(index=8への`cmpSetupObject(true)`呼び出し元)を静的解析した結果、`0x1822DA3FB`〜開始の関数内に`target==8`専用の描画・ハイライト経路が実在することを確認した(`cmpDrawSkillのような専用9番目slot presentation path`)。`Hidden9thSlotPathTrace.cs`(hardware execute breakpoint、`0x1822DA48C`=分岐エントリ/`0x1822DA5FB`=呼び出し完了)で実機比較した結果:
+
+- **High Pixie成功ケース**: `target==8`専用pathが繰り返し発火。`BRANCH-ENTRY`→`CALL-DONE`が対になって発火し続けた。`skillCurObj[8]`は`activeSelf=True`/`activeInHierarchy=True`、`await2_01`のテキストも`TMC21`(ハイライト材質)で正しく表示された。
+- **Frost失敗ケース**: `seq=21`、`bridgeActive=True`、hidden entry表示中(`CursorPos.Shift=8`/`target=8`は維持)でも、`BRANCH-ENTRY`は0件。`skillCurObj[8]`は`activeSelf=False`/`activeInHierarchy=False`のまま。
+
+`Hidden9thGateCascadeTrace.cs`(hardware execute breakpoint x4、`0x1822DA3FC`カスケード開始点〜`0x1822DA46C`gate6通過点)による追加計測(ログ: `investigations/HIDDEN_SKILL_ENTRY/logs/Latest-frost-gatecascade-20260914-131317.log`)では、Frostのhidden UI表示中(frame 7616〜8469付近)、`0x1822DA3FC`以降のcascade checkpointがほぼ発火しなかった(`bridgeActive=True`期間のヒットは実質1件のみ、seq21→22遷移直前の境界ケース)。
+
+**ただしここから「`0x1822DA3FC`を含む関数自体が呼ばれていない」と断定してはいけない。`0x1822DA3FC`が本当にfunction entryそのものかは未確認であり、関数には入っているがそれより前のpre-gateで別経路へ抜けている可能性が残っている。**
+
+## 次回再開地点(2026-09-14)
+
+現在の重要CONFIRMED:
+
+1. hidden entry時の論理カーソル: `CursorPos.Index=0`、`CursorPos.Shift=8`、`target=Shift+Index=8`。
+2. 通常skill highlight: `0x1822D97C0`〜の処理で`target==ebx`を判定し、`ebx=0..7`のみ走査。`target=8`では通常0..7 highlightは成立しない。
+3. ただしゲーム側には`target==8`専用pathが別に存在する。`0x1822DA483`: `cmp ecx,8` — `target==8`なら専用ブロックへ入り、最終的に`cmpSetupObject(skillCurObj[8], true)`を呼ぶ。runtimeでも`index=8`/`caller=0x1822DA5FB`を捕捉済み。
+4. High Pixie成功ケース: `target==8`専用pathが繰り返し発火。`BRANCH-ENTRY`→`CALL-DONE`が対になって発火。`skillCurObj[8]`: `activeSelf=True`/`activeInHierarchy=True`。`await2_01`も`TMC21`で正しくハイライト表示。
+5. Frost失敗ケース: `seq=21`、`bridgeActive=True`、hidden entry表示中でも`CursorPos.Shift=8`/`target=8`は維持。しかし`target==8`専用pathの`BRANCH-ENTRY`は0件。`skillCurObj[8]`: `activeSelf=False`/`activeInHierarchy=False`。
+6. 最新Frost gate cascadeログ: `investigations/HIDDEN_SKILL_ENTRY/logs/Latest-frost-gatecascade-20260914-131317.log`。Frostのhidden UI表示中(frame 7616〜8469付近)、`0x1822DA3FC`以降のcascade checkpointはほぼ発火せず。`bridgeActive=True`期間のヒットは実質1件のみ。**ただしここから「containing function自体が呼ばれていない」と断定してはいけない。`0x1822DA3FC`がfunction entryそのものか未確認。関数には入っているが、それより前のpre-gateで別経路へ抜けている可能性が残っている。**
+
+### 次回の最優先タスク
+
+`0x1822DA3FC`を含む関数の「正確なfunction entry VA」をまず特定する。
+
+その上でruntime比較:
+
+```text
+DR0 = containing function entry
+DR1 = 0x1822DA3FC
+必要ならDR2/DR3 = entry〜0x1822DA3FC間の主要branch
+```
+
+Frost hidden-entry滞在中に比較する。
+
+- **Case A**: function entryは大量発火、`0x1822DA3FC`は発火しない → 関数内のpre-gateが原因 → entry〜`0x1822DA3FC`間を静的解析して最初の脱落点を特定。
+- **Case B**: function entry自体が発火しない → caller / redraw trigger側が原因 → そこで初めて上位callerを追跡。
+
+**重要**: まだ修正PoCには進まない。次回はまず「関数に入っていない」のか「関数には入るが`0x1822DA3FC`より前で脱落している」のかを確定すること。High Pixie成功ケースとFrost失敗ケースの差分を最優先にする。
 
 ## NEXT
 
-1. **(実施済み、実機テスト待ち)** `awaitText[]`/`awaitObj[]`の内容・active状態・Animator状態を`StatusUiArrayFieldTrace.cs`に追加。
-2. **(実施済み、実機テスト待ち)** `GameObject.SetActive`をHarmonyでグローバルにフックし、呼び出し対象が`statusUI.skillCurObj[]`の要素かどうかをポインタ比較で判定するevent-driven trace(`SkillCurObjSetActiveTrace.cs`)を追加。
-3. ダツエバ(第三ケース)でテストを実施し、native forget / High Pixie型 bridge / Frost型 bridge の3ケースで`awaitText`/`awaitObj`/`eventNums`/`eventOfs`を比較する。
-4. 差分が確認できたら、`awaitObj[i]`のactive/Animator状態を実際に制御しているコード箇所を、`GameObject.SetActive`イベントtraceおよびAnimatorパラメータ変更の観測から特定する。
+1. **(次の本命)** `0x1822DA3FC`を含む関数の正確なfunction entry VAを特定し、上記Case A/Bの切り分けを行う。
+2. `CursorPos.InvisibleListNums`の実際の役割・更新タイミングを確認し、stale値仮説を検証する。
+3. await系(息吹の具足)ケースでも同じ`HighlightTargetGateTrace`計測を行い、`target==ebx`不一致で説明できるか確認する。
+4. 原因(function entryとの位置関係)が特定できてから、初めて修正方針(PoC)の検討に入る。まだ着手しない。
 
 ## 現在の優先順位
 

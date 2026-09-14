@@ -558,15 +558,25 @@ Phase Bの調査(R0-A/R0-B/R0-Cのnative CFG、`investigations/REPEAT_UNLIMITED/
 - 実描画は Unity側の `statusUI` MonoBehaviour(Assembly-CSharp, global namespace、GameObject `Canvas_UI/campUIBase/statusUI(Clone)`)が担っている。`TextMeshProUGUI[] obtainedText` / `GameObject[] skillCurObj`(16要素)等のフィールドを持つ。
 - `skillCurObj[i].activeSelf`は`obtainedText[i]`の`<material="TMC21">`タグと完全に相関する(21サンプル中不一致ゼロ)。選択ハイライトの実体としてSTRONGLY SUPPORTED。
 - フロストの forget フロー中、Learn-As-Newで習得したスキルの表示に差し替えられた行(`obtainedText[7]`)だけ、観測された全サンプルで`skillCurObj[7].activeSelf`が一度も`True`にならなかった。ユーザーの実機目視確認(「ハイライト枠は見えない」)と一致。**master-archive.md Section 22の現象がV3 zero-base移行後も再現することが確定した。**
-- **モデル修正**: 「所持8スキルとは別の9番目の特殊スロット」という前提は誤り。実際は通常8行(`obtainedText[0..7]`)のうち1行が、bridgeフロー中にpending/new skill表示へcontent差し替えされているだけである。
 - `statusUI`自身のIL2CPPメタデータ上のmanagedメソッドは`Awake`/`OnDisable`/`.ctor`の3つのみ。`obtainedText[i]`差し替えや`skillCurObj[i]`のON/OFFは別クラスが外部からpublicフィールドを直接操作して行っている。
+- **根本原因(2026-09-14、CONFIRMED — static disassembly + 独立した2系統のruntime計測 + 実機症状が一致、User承認済み)**: hidden entry滞在時、`CursorPos.Index=0`/`CursorPos.Shift=8`となり、ハイライト判定用の`target`(`=Shift+Index`)は`8`になる。一方、ハイライト描画側ループ(VA `0x1822D97C0`、`cmpUpdate.cmpSetupObject`(VA `0x182620A80`)の呼び出し元)は`ebx=0..7`(`loopUpper=8`)しか回らないため、`target == ebx`が一度も成立せず、`cmpSetupObject(skillCurObj[ebx], true)`がどの行に対しても呼ばれない。その結果、論理選択・説明文表示・決定操作は機能するが、選択ハイライトだけが表示されない。
+  - `cmpSetupObject`が`skillCurObj[i].SetActive`の直接ラッパーであることをhardware breakpointで確認済み(`SkillCurObjNativeCallerProbe.cs`)。
+  - ハイライトON判定の実体(`target == ebx`のゲート、VA `0x1822D9AFD`)を別のhardware breakpointで直接計測済み(`HighlightTargetGateTrace.cs`)。hidden entry滞在中、`target=8; loopUpper=8; ebx=0〜7全てmatch=False`を実機ログで確認。
+  - 同時刻の`HIDDEN-SLOT-ARRAY-CHECK`ログでも、cursor=8(=hidden entry位置)の瞬間に`selectSkillID`が所持8スキル配列外の値(pending new skillのID)を指すことを確認済み。ただしこの`selectSkillID`解決自体は**native自身ではなく、`AddNewHighlightCorrection.cs`(このMOD自身のコード、legacy実装の再現)がAddNewブリッジ有効時のみ行っているもの**であり、native自身の挙動として確認されたわけではない(2026-09-14訂正)。
+  - 「所持8スキルとは別の9番目の特殊スロット」という当初モデルは配列構造としては誤りだった(2026-09-14 PLAN.mdモデル再修正参照)が、カーソルの論理位置としては実質的に「9番目相当(target=8)」を指しているため、現象としては一貫する。
+- **`CursorPos.Shift=8`のwriter(2026-09-14、CONFIRMED)**: `CursorPosShiftWriteWatchTrace.cs`(hardware write breakpoint)で特定。native自身のforget flow開始時(seq=8、bridgeActive=False)にVA `0x182288AC1`(`mov byte ptr [rcx+0x14], 8`)で無条件に書き込まれる。AddNewブリッジ経路(seq=21、bridgeActive=True)では、入力方向コードに応じて分岐する別関数(`cmpUpdateSkillSelect`と推定)内のVA `0x182289313`(`mov byte ptr [rax+0x14], 8`)で条件付きに書き込まれる。通常のカーソル移動(0〜7の増減)は別のwriter(VA `0x1822EDE25`ほか)が担当し、こちらは`8`を生成しない。
+- **スコープ確定(2026-09-14、CONFIRMED、User訂正済み)**: nativeの通常Power-Upは上書き方式であるため、`Shift=8`の状態を「9番目の選択肢」としてプレイヤーに操作させる状況が発生しない。一方AddNewブリッジでは、その内部状態(`Shift=8`)をユーザー操作可能なUIまで持ち込んでしまうため、通常のハイライト描画ループ(`ebx=0..7`)との不整合が可視化される。**したがって本現象はAddNewブリッジ経路に固有**であり、native自身の`Shift=8`書き込みは(それ自体が「単なる副産物」と断定はできないが)実害のある可視状態には到達しない。
+- **`target==8`専用presentation pathの実在(2026-09-14、CONFIRMED)**: `SkillCurObjNativeCallerProbe`の実機ログで、通常行0〜7の`cmpSetupObject(true)`呼び出しは全て`0x1822D9C6B`に収束する一方、**index=8だけは別のcaller(`0x1822DA5FB`)から`value=True`が観測された**。静的解析(VA `0x1822DA3FB`〜)の結果、ゲーム側に`target==8`(`cmp ecx,8`、VA `0x1822DA483`)専用の名前解決・描画・`cmpSetupObject(skillCurObj[8],true)`呼び出し経路が実在することを確認した。
+- **High Pixie成功 vs Frost失敗の比較(2026-09-14、CONFIRMED)**: `Hidden9thSlotPathTrace.cs`で比較したところ、High Pixieでは`target==8`専用pathが繰り返し発火し(`skillCurObj[8]`が`active=True`/`inHierarchy=True`になり`await2_01`もハイライト表示)、Frostでは`CursorPos.Shift=8`が維持されているにもかかわらず`BRANCH-ENTRY`が0件だった(`skillCurObj[8]`は`active=False`のまま)。さらに`Hidden9thGateCascadeTrace.cs`による計測では、Frostのhidden UI表示中、`0x1822DA3FC`(専用path内のカスケード開始点と推定)以降のcheckpointがほぼ発火しなかった。**ただし`0x1822DA3FC`が本当にfunction entryそのものかは未確認であり、「関数自体が呼ばれていない」のか「関数には入るがそれより前のpre-gateで別経路へ抜けている」のかは未確定(次回最優先タスク、詳細は`investigations/HIDDEN_SKILL_ENTRY/PLAN.md`の「次回再開地点」参照)。**
 
 ### UNRESOLVED
 
-- `skillCurObj[i]`を実際にset(`GameObject.SetActive`)している外部クラス・メソッドが未特定(`SkillCurObjSetActiveTrace.cs`によるevent-driven traceを実装・deploy済み、実機テスト待ち)。
-- 「差し替え行だけ漏れる」正確な原因は未特定(仮説段階)。
+- `0x1822DA3FC`を含む関数の正確なfunction entry VAが未特定。それにより「関数自体が呼ばれていないのか」「関数には入るがpre-gateで脱落しているのか」(Case A/B)が未確定(**次回最優先タスク**)。
+- `CursorPos.InvisibleListNums=0`だった観測の意味(名称からは「隠しエントリ数」を示唆するが、hidden entry発生時でも0だった)。stale値の可能性を含め未検証。
+- await系(`awaitObj`/`awaitText`、息吹の具足のケース)とdirect obtained系(`obtainedText[7]`直接差し替え、会心のケース)が同じ`target==ebx`不一致で説明できるかは未検証。
+- 最終的な修正方法(Case A/Bの切り分け結果を踏まえてから検討。「ゲームが本来持つ9番目表示経路をAddNewブリッジから正しく使う」案と、「描画ループ側にtarget==8の特別処理を追加する」案の両方が候補)。
 
-### READY FOR PRODUCTION: NO(調査継続中、修正実装なし)
+### READY FOR PRODUCTION: NO(根本原因はCONFIRMED、修正実装はまだ)
 
 ## 既知の別issue(記録のみ、本investigation対象外)
 
