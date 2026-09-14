@@ -66,41 +66,37 @@ namespace NocturneModernGameplay
             SelectSkillIdOffsetProbe.TryProbe();
             // SkillCurObjNativeCallerProbe / HighlightTargetGateTrace /
             // CursorPosShiftWriteWatchTrace / SelectSkillIdWriteWatchTrace /
-            // Hidden9thSlotPathTrace .Tick()/FlushPendingLogs() are
-            // deliberately NOT called this session: all of these classes
-            // (plus Hidden9thGateCascadeTrace below) install hardware
-            // breakpoints on the same DR0-DR3 registers
-            // (InstallHardwareBreakpoint(s)OnCurrentThread unconditionally
-            // claims them), and running more than one at once would have
-            // the later Install() silently steal registers out from under
-            // the earlier one, breaking it without any error. All five
-            // already answered the question they were built for: caller
-            // converges on cmpSetupObject VA 0x182620A80; highlight gate's
-            // `target` is 8 while sitting on the hidden entry, one past
-            // loopUpper=8; CursorPos.Shift=8 is written unconditionally by
-            // native at VA 0x182288AC1 and conditionally by the AddNew
-            // bridge path at VA 0x182289313; GBWK.SelectSkillID's native
-            // writer search was abandoned as moot; and Hidden9thSlotPathTrace
-            // found the decisive asymmetry - High Pixie's AddNew-bridge
-            // case reaches AND completes the dedicated target==8 branch
-            // (skillCurObj[8] ends up active/inHierarchy=True), while
-            // Frost's AddNew-bridge case reaches the branch-entry
-            // breakpoint (VA 0x1822DA48C) ZERO times despite CursorPos.
-            // Shift staying 8 for its entire seq21/22 episode - see
+            // Hidden9thSlotPathTrace / Hidden9thGateCascadeTrace /
+            // FclChkMessageResultTrace / CmpDrawSkillR13LoopBoundTrace
+            // .Tick()/FlushPendingLogs() are deliberately NOT called this
+            // session: all of these classes (plus R13FetchAndWriteWatchTrace
+            // below) install hardware breakpoints on the same DR0-DR3
+            // registers (InstallHardwareBreakpoint(s)OnCurrentThread
+            // unconditionally claims them), and running more than one at
+            // once would have the later Install() silently steal registers
+            // out from under the earlier one, breaking it without any
+            // error. This investigation's history (all CONFIRMED, see
             // 01_CURRENT_STATE.md / investigations/HIDDEN_SKILL_ENTRY/
-            // PLAN.md, all CONFIRMED. Hidden9thGateCascadeTrace (below) is
-            // the active investigation now - it uses all 4 hardware
-            // breakpoint registers (DR0-DR3) as a ladder of real EXECUTE
-            // breakpoints at each gate's own fallthrough address (an
-            // earlier managed-context-replication design was tried and
-            // proven unreliable - see that file's own 2026-09-14
-            // correction note - one of the gates reads a highly volatile,
-            // frequently-reused shared value that a same-frame
-            // out-of-band read cannot trust). Uninstall() below still runs
-            // for all of them so any leftover state from a prior build is
-            // cleaned up.
-            Hidden9thGateCascadeTrace.Tick();
-            Hidden9thGateCascadeTrace.FlushPendingLogs();
+            // PLAN.md for full detail) narrowed from "does the presentation
+            // function even get called" down to a single byte:
+            // CmpDrawSkillR13LoopBoundTrace found the candidate-scan loop
+            // bound ([r13+0x10] inside cmpDrawSkill) is 1 or 2 for High
+            // Pixie's succeeding AddNew-bridge case and exactly 0 for
+            // Frost's failing one (242 vs 238 hits, zero exceptions either
+            // way) - structurally meaning Frost's loop (and the dedicated
+            // target==8 path deeper in it) is skipped entirely.
+            // R13FetchAndWriteWatchTrace (below) is the active investigation
+            // now - identifying the WRITER of that count via a dynamic
+            // hardware write-watch (DR1 is reprogrammed to the current
+            // frame's [r13+0x10] every time cmpDrawStatusComEx2's fetch
+            // point fires, since `r13` is a fresh object each call and a
+            // static-address watch cannot pre-exist it), plus the
+            // earliest-observable value at fetch time and the final value
+            // cmpDrawSkill's own loop sees, all in one pass. Uninstall()
+            // below still runs for all of them so any leftover state from a
+            // prior build is cleaned up.
+            R13FetchAndWriteWatchTrace.Tick();
+            R13FetchAndWriteWatchTrace.FlushPendingLogs();
         }
 
         public override void OnDeinitializeMelon()
@@ -112,6 +108,9 @@ namespace NocturneModernGameplay
             SelectSkillIdWriteWatchTrace.Uninstall();
             Hidden9thSlotPathTrace.Uninstall();
             Hidden9thGateCascadeTrace.Uninstall();
+            FclChkMessageResultTrace.Uninstall();
+            CmpDrawSkillR13LoopBoundTrace.Uninstall();
+            R13FetchAndWriteWatchTrace.Uninstall();
             SkillCntWriterCaptureProbe.Uninstall();
             EventParamWriterCaptureProbe.Uninstall();
             GameplayFeatureRegistry.Shutdown();

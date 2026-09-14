@@ -240,6 +240,56 @@ nativeの通常Power-Upは上書き方式であるため、`Shift=8`の状態を
 
 **ただしここから「`0x1822DA3FC`を含む関数自体が呼ばれていない」と断定してはいけない。`0x1822DA3FC`が本当にfunction entryそのものかは未確認であり、関数には入っているがそれより前のpre-gateで別経路へ抜けている可能性が残っている。**
 
+## CONFIRMED(static disassembly、2026-09-14、Case A/B切り分け完了)
+
+IL2CPPメタデータの`Assembly-CSharp.dll` `CodeGenModule.methodPointers`テーブルを全件走査し(`.analysis/scratch_find_func_start_0x1822da3fc.py`)、`0x1822DA3FC`以下・以上で最も近い管理メソッドVAを機械的に特定した。
+
+- `0x1822DA3FC`以下で最も近い管理メソッドVA: `0x1822D97C0` = `cmpDrawStatus.cmpDrawSkill`(距離`0xC3C`バイト)。
+- `0x1822DA3FC`以上で最も近い管理メソッドVA: `0x1822DB3A0` = `cmpDrawStatus.cmpDrawStatusComEx2`(距離`0xFA4`バイト)。
+
+`0x1822D97C0`から`0x1822DB3A0`までの領域(`0x1BE0`バイト)をbyte-levelで走査し(`.analysis/scratch_verify_cmpdrawskill_contains_target.py`)、`ret`直後に3バイト以上の`0xCC`(int3)paddingが続く箇所(=関数境界)が一つも無いことを確認した。`0x1822D97C0`自体は標準的なMSVC/IL2CPPプロローグ(パラメータspill → `push rdi/r12/r13/r15` → `sub rsp,0x98`)を持つ正規の関数エントリである。
+
+**結論(CONFIRMED — static disassembly)**: `0x1822DA3FC`は独立した別関数ではなく、`cmpDrawSkill`本体(エントリ`0x1822D97C0`)の内部、エントリから`0xC3C`バイト先に位置する。`cmpDrawSkill`は通常行0〜7のハイライトループ(`0x1822D9AFD`の`target==ebx`ゲート含む)と全く同じ関数であり、この`0x1822D9AFD`はFrost hidden entry滞在中も`HighlightTargetGateTrace`で発火が直接確認済み(`target=8; loopUpper=8; ebx=0〜7全てmatch=False`、既存CONFIRMED runtime)。`0x1822D9AFD`は関数エントリから`0x33D`バイトの位置にあり、同じ連続した1関数内で`0x1822DA3FC`より手前にあるため、`0x1822D9AFD`の発火は`cmpDrawSkill`のエントリ自体が毎フレーム実行されていることの間接証明になる。
+
+**→ Case A確定(関数自体は呼ばれている。`0x1822D9AFD`と`0x1822DA3FC`の間のどこかにpre-gateが存在し、そこでFrostのみ経路が外れる)。Case B(関数自体が呼ばれていない)は棄却する。**
+
+### 新知見: `0x1822DA3FC`直前のゲート構造(static disassembly、`.analysis/scratch_disasm_span_0x1822d9afd_to_0x1822da3fc.py`)
+
+`0x1822D9AFD`から`0x1822DA3FC`まで通しで逆アセンブルした結果、以下の構造を確認した(byte-exact):
+
+- `0x1822D9AFD`(`target==ebx`不一致)で`0x1822D9C7C`へ分岐した後、`r14b`(3値、`[rsp+0x100]`から一度だけ読み込まれるbyteパラメータ)による3-way switch(`test r14b,r14b` → `sub 1` → `cmp 1`)で経路が分かれるが、最終的にどの経路も`0x1822DA051`の共通ループへ合流する。
+- `0x1822DA051`ループ: `r15d`(ループindex、`0`から`ebx=[r13+0x10]`未満まで)。`r13`はこの関数の別のパラメータ由来のポインタ(`[rsp+0xE0]`)。ループ内で`statusUI`とは別の"source object"風chain(`[rip+X][+0xb8][+8]`、既知の`GBWK+0xb8`系パターンと同型)経由で`+0xc8`/`+0xd0`/`+0x128`/`+0x130`オフセットの配列へ`cmpSetupObject(obj,set)`(=`skillCurObj`等のSetActiveラッパー、既知VA`0x182620a80`)を複数回呼んでいる。`+0xc8`/`+0xd0`は`statusUI.awaitObj`/`await2Obj`と同一offsetであり、この番号が一致するのは偶然ではなく、このループ自体が「awaitObj/await2Obj/9番目slot」presentationの本体である可能性が高い(未確定、次回要検証)。
+- `0x1822DA3FC`直前の即時ゲート列(`0x1822DA3AC`〜`0x1822DA3FC`):
+  1. `cmp word ptr [rax + r14*2 + 0x20], 0x165` / `jne` — 候補配列の要素(word、stride 2)がskill ID `0x165`(=357)と一致するかの分岐。不一致なら次のチェックへ、一致した場合は追加関数(`0x18203f220`)を呼び、`al==0`なら`0x1822DA852`へ大きく迂回する。
+  2. `test bpl,bpl` / `js 0x1822DA40D` — `bpl`が負なら`0x1822DA3FC`をスキップ。
+  3. `cmp sil,1` / `jne 0x1822DA40D` — `sil != 1`なら`0x1822DA3FC`をスキップ。
+  4. `cmp bpl,8` / `jne 0x1822DA40D` — `bpl != 8`なら`0x1822DA3FC`をスキップ。
+  5. 上記全て通過した場合のみ、IL2CPP診断ログガード定型句(`[rcx+0x12f]`のbit2 test等、他箇所でも頻出する既知パターン)を経て`0x1822DA3FC`(`test r12,r12`)へ到達する。
+
+### `bpl`/`sil`/`r14b`の出自(static disassembly、`.analysis/scratch_disasm_prologue_ebp_esi_origin.py`)
+
+`0x1822D9949`〜`0x1822D9959`で、関数の**スタック渡しパラメータ**から一度だけ読み込まれていることを確認した:
+
+```
+0x1822D9949  movzx ebp, byte ptr [rsp+0xE8]
+0x1822D9951  movzx esi, byte ptr [rsp+0xF0]
+0x1822D9959  movzx r14d, byte ptr [rsp+0x100]
+```
+
+3つともbyteサイズで、`cmpDrawSkill`のシグネチャ末尾(`CursorMode`/`NextSkillColor`/`DrawMode`/`Style`等の列挙型引数群、`01_CURRENT_STATE.md`記載のシグネチャ参照)のいずれかに対応すると推定される(未確定、パラメータ名との1対1対応は未特定)。
+
+**重要な留保(CONFIRMEDへ未昇格の理由)**: `ebp`/`esi`/`r14d`は`CursorPos`構造体経由の毎回dereference(`target=Shift+Index`のような)ではなく、関数呼び出し時に一度だけ渡される引数値である。したがって`bpl==8`ゲートが「Frostでは不成立・High Pixieでは成立」という**呼び出し元側の値の違い**によるものなのか、あるいは常に固定値でありこのゲート自体はFrost/High Pixie間で差が無く別の分岐(`r14b`の3-way switchや`ebx=[r13+0x10]`のループ境界)が真の分岐点なのかは、**呼び出し元(`cmpDrawStatusComEx2`と推定)がこれらの引数に何を渡しているかを未解析のため、現時点では未確定**。
+
+### 次の焦点(更新)
+
+Case A/Bの切り分けは完了した(Case A確定)。次はCase A内部でのpre-gate特定に進む。優先順位:
+
+1. `cmpDrawSkill`の呼び出し元(`cmpDrawStatusComEx2`、既知)が、スタック引数`[rsp+0xE8]`/`[rsp+0xF0]`/`[rsp+0x100]`(= 関数内`ebp`/`esi`/`r14d`)に何を渡しているかを静的解析する。固定値なら`bpl==8`ゲートはFrost/High Pixie間で無差別と判断し、`r14b`の3-way switchまたは`ebx=[r13+0x10]`ループ境界(`r13`の実体特定含む)を次の焦点にする。
+2. `r13`(`[rsp+0xE0]`由来のポインタ、`0x1822DA051`ループの走査対象)の実体を特定する。`+0x10`(loop bound)と`+0x20+i*2`(ループ内でaccessされるword、`0x1822DA070`の`[r13+0x10]`および後続の`[rax+r14*2+0x20]`等、複数の別objectとの混同に注意)の意味論。
+3. 上記1・2が判明してから、runtime hardware breakpointで`bpl`/`sil`/`r14b`実測値、または`ebx=[r13+0x10]`実測値をFrost hidden-entry滞在中とHigh Pixie成功時で比較する(次回実機テスト)。
+
+**重要**: まだ修正PoCには進まない。上記の静的解析(呼び出し元の引数値、`r13`実体)を先に完了させること。
+
 ## 次回再開地点(2026-09-14)
 
 現在の重要CONFIRMED:
@@ -251,31 +301,137 @@ nativeの通常Power-Upは上書き方式であるため、`Shift=8`の状態を
 5. Frost失敗ケース: `seq=21`、`bridgeActive=True`、hidden entry表示中でも`CursorPos.Shift=8`/`target=8`は維持。しかし`target==8`専用pathの`BRANCH-ENTRY`は0件。`skillCurObj[8]`: `activeSelf=False`/`activeInHierarchy=False`。
 6. 最新Frost gate cascadeログ: `investigations/HIDDEN_SKILL_ENTRY/logs/Latest-frost-gatecascade-20260914-131317.log`。Frostのhidden UI表示中(frame 7616〜8469付近)、`0x1822DA3FC`以降のcascade checkpointはほぼ発火せず。`bridgeActive=True`期間のヒットは実質1件のみ。**ただしここから「containing function自体が呼ばれていない」と断定してはいけない。`0x1822DA3FC`がfunction entryそのものか未確認。関数には入っているが、それより前のpre-gateで別経路へ抜けている可能性が残っている。**
 
-### 次回の最優先タスク
+### 次回の最優先タスク(2026-09-14更新、Case A/B切り分け完了済み)
 
-`0x1822DA3FC`を含む関数の「正確なfunction entry VA」をまず特定する。
+**Case A/Bの切り分けは静的解析で完了した(上記「CONFIRMED(static disassembly、2026-09-14、Case A/B切り分け完了)」参照、Case A確定)。** `0x1822DA3FC`は`cmpDrawSkill`本体(エントリ`0x1822D97C0`)の内部にあり、独立した別関数ではない。したがって当初計画していた「DR0=function entry / DR1=0x1822DA3FC」のruntime比較は、function entry側は`0x1822D9AFD`(既存`HighlightTargetGateTrace`)の発火で既に間接証明済みのため、優先度を下げる。
 
-その上でruntime比較:
+(このタスクは下記「CONFIRMED(static disassembly、2026-09-14、呼び出し元チェーン全解析 — `bpl`/`sil`ゲートの出自を`fclChkMessage`まで特定)」で完了した。)
+
+## CONFIRMED(static disassembly、2026-09-14、呼び出し元チェーン全解析 — `bpl`/`sil`ゲートの出自を`fclChkMessage`まで特定)
+
+`cmpDrawSkill`呼び出し元を1段ずつ逆アセンブルで遡り(直接call xref scan、各関数のプロローグからスタックフレームsize差分を計算して引数slotを対応付け)、以下の呼び出しチェーンをbyte-exactで確定した:
 
 ```text
-DR0 = containing function entry
-DR1 = 0x1822DA3FC
-必要ならDR2/DR3 = entry〜0x1822DA3FC間の主要branch
+rstdraw.rstDraw (VA 0x182282B70、switch dispatch on [source object+0x10]+0x11)
+  ├─ seq=21 → rstDrawSeqDestroySkill(pStock, param2=1)   VA 0x1822830F6→0x182283102
+  └─ seq=22 → rstDrawSeqDestroySkill(pStock, param2=0)   VA 0x182283109→0x182283115
+       ↓ (VA 0x182282900のrstDrawSeqDevilStatusSkillPUpとは別、rstDrawSeqDestroySkill = VA 0x1822824D0)
+rstdraw.rstDrawSeqDestroySkill
+  → cmpDrawStatus.cmpDrawStatusComEx(引数, param3=sil, param4=r15b)   call site VA 0x18228289D
+    → cmpDrawStatus.cmpDrawStatusComEx2(引数, arg5=bpl, arg6=sil, arg12=r14d)  call site VA 0x1822DBCF7
+      → cmpDrawStatus.cmpDrawSkill(...)  call site VA 0x1822DB846
 ```
 
-Frost hidden-entry滞在中に比較する。
+各段でスタック渡し引数のみが未確定のまま伝播しており(comEx/comEx2とも当該slotへの自前write無し、純粋pass-through)、`cmpDrawSkill`内の`bpl`/`sil`/`r14d`はそれぞれ以下に帰着する:
 
-- **Case A**: function entryは大量発火、`0x1822DA3FC`は発火しない → 関数内のpre-gateが原因 → entry〜`0x1822DA3FC`間を静的解析して最初の脱落点を特定。
-- **Case B**: function entry自体が発火しない → caller / redraw trigger側が原因 → そこで初めて上位callerを追跡。
+- **`sil`(= `cmpDrawSkill`内、`0x1822DA3D2`の`cmp sil,1`ゲート)** ← `cmpDrawStatusComEx`の`param4`(`r9b`) ← `rstDrawSeqDestroySkill`**自身の`param2`**(`rstDraw`のjump tableからそのまま渡る定数、`seq21`なら`1`、`seq22`なら`0`)。
+- **`bpl`(= `cmpDrawSkill`内、`0x1822DA3D8`の`cmp bpl,8`ゲート)** ← `cmpDrawStatusComEx`の`param3`(`r8b`) ← `rstDrawSeqDestroySkill`**自身のローカル変数`sil`**(このローカルは`rstDrawSeqDestroySkill`独自の一時変数で、上記チェーン外部の`cmpDrawSkill`側`sil`とは別物。以下参照)。
 
-**重要**: まだ修正PoCには進まない。次回はまず「関数に入っていない」のか「関数には入るが`0x1822DA3FC`より前で脱落している」のかを確定すること。High Pixie成功ケースとFrost失敗ケースの差分を最優先にする。
+### `rstDrawSeqDestroySkill`内部ロジック(CONFIRMED static disassembly、byte-exact)
 
-## NEXT
+```csharp
+// 疑似コード。VAは全てrstDrawSeqDestroySkill(0x1822824D0)本体内。
+int cursorIndex = cmpMisc.cmpGetCursorIndex(rbx);   // call VA 0x18228255E, 実名確認済み(IL2CPPメタデータ完全一致)
+byte sil;
+if (param2 == 0) {                                   // r15b、自身のparam2(dl)。seq22で0、seq21で1
+    sil = 0xFF;                                       // VA 0x18228256A、無条件強制
+} else {
+    bool bMsg = fclMisc.fclChkMessage(0);              // call VA 0x18228258F、実名確認済み
+    bool suppress = (bMsg != 0);                       // call VA 0x182225BA = 0x18138BE10、下記参照
+    if (suppress) {
+        sil = 0xFF;                                     // VA 0x1822825C3
+    } else {
+        sil = (byte)cursorIndex;                         // VA 0x1822825C8以降、esiをそのままsilとして使用
+    }
+}
+// sil はこの後 comEx の param3(r8b) として渡る → 最終的に cmpDrawSkill の bpl になる
+```
 
-1. **(次の本命)** `0x1822DA3FC`を含む関数の正確なfunction entry VAを特定し、上記Case A/Bの切り分けを行う。
-2. `CursorPos.InvisibleListNums`の実際の役割・更新タイミングを確認し、stale値仮説を検証する。
-3. await系(息吹の具足)ケースでも同じ`HighlightTargetGateTrace`計測を行い、`target==ebx`不一致で説明できるか確認する。
-4. 原因(function entryとの位置関係)が特定できてから、初めて修正方針(PoC)の検討に入る。まだ着手しない。
+- `cmpMisc.cmpGetCursorIndex(_ptr)`: VA `0x1822ED1C0`、IL2CPPメタデータで実名確認済み(offset+0、`_ptr`の1パラメータ)。
+- `fclMisc.fclChkMessage`: VA `0x182169960`、IL2CPPメタデータで実名確認済み(offset+0)。引数`0`(定数)。
+- `0x18138BE10`(旧称"secondary flag-check"): int3paddingで関数境界確認済み(`0x18138BE0E`直前まで`int3`×2、直後`0x18138BE16`以降`int3`×10)。**中身は`test cl,cl; setne al; ret`の3命令のみ**。IL2CPPメタデータの管理メソッド境界とは一致せず(nearest matchは`ComputeStringHash`内部+巨大offsetで無関係)、CRT/codegenの汎用bool正規化thunkと判断する。**独自の判定ロジックは一切持たない(`return (cl != 0)`のみ)**。したがって呼び出し元の分岐は実質的に`fclChkMessage(0) != 0`そのものであり、`0x18138BE10`自体は分岐要因から除外できる。
+
+**結論(CONFIRMED — static disassembly)**: `seq21`(通常の選択中、プレイヤーが実際に操作する場面)においても、`bpl==8`ゲート(hidden entryの9番目専用presentation path起動条件)へ到達できるかどうかは、最終的に**`fclMisc.fclChkMessage(0)`の戻り値のみ**で決まる。`0!=0`(=falsy)なら実カーソルインデックスがそのまま`bpl`まで伝播し(hidden entry滞在中なら`cmpGetCursorIndex()==8`のはずで`bpl==8`ゲート成立)、非0(truthy)なら`sil`(rstDrawSeqDestroySkill内ローカル)が無条件`0xFF`に潰され、`cmpDrawSkill`側`bpl`も`0xFF`となり`bpl==8`ゲートは絶対に成立しない。
+
+**留保**: `fclChkMessage`という名前から「メッセージウィンドウ表示中判定」という意味を推定しているが、この関数自体の内部実装は未解析(呼び出し先の中身は見ていない)。名前と引数`0`からの意味論的解釈であり、CONFIRMEDとするのは「これが分岐を最終的に決めている」という構造的事実までである。「メッセージウィンドウ表示中だから無効化される」という意味論的解釈はSTRONGLY SUPPORTEDまでに留め、CONFIRMEDへは昇格しない。
+
+### 次のruntime観測点(確定、最小構成)
+
+```text
+観測対象: fclMisc.fclChkMessage(0) の戻り値(AL)
+観測地点: rstDrawSeqDestroySkill内、call 0x182169960 の直後(VA 0x182282594、または movzx ebx,al 実行後のVA 0x18228259B)
+観測条件: seq==21 かつ カーソルがhidden entry上(既存SkillCursorFieldTrace等で判定可能)
+
+期待される決定打:
+  High Pixie hidden entry: fclChkMessage(0) == 0  → sil=cursorIndex(=8) → 専用path成立
+  Frost hidden entry:      fclChkMessage(0) != 0  → sil=0xFF           → 専用path不成立
+```
+
+## REJECTED(2026-09-14、実機runtime、`fclChkMessage`仮説)
+
+`FclChkMessageResultTrace`による実機観測(`unit=59`/`unit=60`、AddNewブリッジ中の`bridgeActive=True`区間、計421ヒット)の結果:
+
+- `unit=59`(High Pixie想定): `bridgeActive=True`中の193ヒット全てで`fclChkMessageResult=0`。
+- `unit=60`(Frost想定): `bridgeActive=True`中の228ヒット全てで`fclChkMessageResult=0`。
+- `cursorIndex`は412サンプルで`8`(hidden entry上)、9サンプルで`4`(移動中)だったが、`fclChkMessageResult`はどちらのunit・どちらのcursorIndexでも例外なく`0`(suppressされない側)だった。
+
+**結論(REJECTED)**: `fclChkMessage(0)`の戻り値はHigh Pixie/Frost間で差が無い(両方とも`0`=非suppress)。もし本仮説が正しければ両者とも`sil=cursorIndex=8`となり`bpl==8`ゲートを通過できるはずだが、既存CONFIRMED runtime(`Hidden9thSlotPathTrace`)ではHigh Pixieのみ`target==8`専用path(`0x1822DA48C`)へ繰り返し到達し、Frostはゼロ回だった。この矛盾により、**`fclChkMessage`ゲートはFrost失敗の直接原因ではないと結論する**。Frost/High Pixieの真の分岐点は、`0x1822DA3FC`(gates 1-2通過点)から`target==8`専用block(`0x1822DA483`)までの間で、まだ詳細に追っていない区間(`0x1822DA051`ループの走査対象`r13`とその`+0x10`(loop bound)、`0x1822DA3AC`のskill ID `0x165`比較、`0x1822DA032`の`r14b`3-way switch)のどこかにある可能性が高い。
+
+`FclChkMessageResultTrace`自体は今回の観測目的を達成した(read-only、副作用なし)ため、次のtraceに置き換える前提で無効化してよい。
+
+## 実装・build・deploy(2026-09-14、このセッション、r13/`[r13+0x10]`観測)
+
+`r13`の出自静的解析(上記REJECTEDセクション末尾参照)を踏まえ、`fclChkMessage`系traceを置き換える形で以下を実装した。
+
+- `src/SkillMutationV3/CmpDrawSkillR13LoopBoundTrace.cs`(新規、read-only): `cmpDrawSkill`内、候補スキャンループ入口の`test r13,r13`直後(VA`0x1822DA05E`)に1点だけhardware execute breakpointを置き、`r13`(ポインタ値)と`[r13+0x10]`(loop bound byte、`r13`が非nullの場合のみ安全にguardして読む)をログ出力する。`target`(`CursorPos.Shift+CursorPos.Index`、managed context側でTick()ごとにキャッシュ)も併記する。GameAssembly.dllへの書き込みは無し。
+- `src/ModMain.cs`: `FclChkMessageResultTrace.Tick()/FlushPendingLogs()`呼び出しを`CmpDrawSkillR13LoopBoundTrace`に差し替え(同一DR0-DR3を奪い合うため同時稼働不可)。`OnDeinitializeMelon`に`CmpDrawSkillR13LoopBoundTrace.Uninstall()`を追加(`FclChkMessageResultTrace.Uninstall()`は残置、既存状態のクリーンアップ用)。
+- Clean build(`bin`/`obj`削除 → `dotnet build`): error 0、warning 9(全て既存warning、今回変更と無関係)。
+- Deploy先: `C:\Program Files (x86)\Steam\steamapps\common\smt3hd\Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `e604e3a72521e6eecd3adcacaf04f1619471896138ffff5844fc159252232fdb`。
+
+ログ確認方法: MelonLoaderの`Latest.log`で`R13LOOPBOUND-INSTALLED`(導入確認)、`R13LOOPBOUND-HIT; frame=...; seq=...; bridgeActive=...; unit=...; target=...; r13=...; loopBound=...;`(各ヒット)を探す。`seq=21`かつ`target=8`(hidden entry上)の行の`r13`(null/非null)と`loopBound`がHigh Pixie/Frostで異なるかを比較する。
+
+## CONFIRMED(2026-09-14、実機runtime — 決定的な分岐点を特定)
+
+`CmpDrawSkillR13LoopBoundTrace`による実機観測(`bridgeActive=True`区間、`unit=59`242ヒット・`unit=60`238ヒット、全て`target=8`)の結果:
+
+- `unit=59`(High Pixie想定): `r13`は常に非null(毎フレーム新規取得されるため値自体は毎回異なるが、nullは一度も無し)。`loopBound`(`[r13+0x10]`)は`1`または`2`(0は一度も無し)。
+- `unit=60`(Frost想定): `r13`は常に非null(unit=59と同様)。`loopBound`は**例外なく全238ヒットで`0`**。
+
+**結論(CONFIRMED runtime)**: `cmpDrawSkill`内の候補スキャンループ(`0x1822DA070`〜`0x1822DA089`: `ebx=[r13+0x10]; cmp eax,ebx; jge <skip全体>`、`eax`はループ内で不変の`0`)は、`loopBound<=0`のとき最初の比較で即座にループ全体を抜ける構造である(static disassembly、既確認)。Frostは`loopBound`が常に`0`であるため、このループ本体(`r15d`走査、skill ID `0x165`比較、最終的に到達する`target==8`専用block`0x1822DA483`を含む)に一度も入らない。High Pixieは`loopBound`が`1`/`2`であるため入り、`target==8`専用presentation pathへ到達できる。
+
+**これが「Frostだけhidden entryのハイライトが表示されない」という当初症状の直接原因(native側の分岐点)として確定した。** `r13`自体の正体(IL2CPPのstatic-field-fetch idiomで毎フレーム新規取得される、GBWK/ACTIONと同一static clusterの`0x182E46A50`経由のオブジェクト)は未特定のままだが、その`+0x10`が「(pending/候補)要素数」的なカウントフィールドであることは、この挙動から強くSTRONGLY SUPPORTEDされる(名前・型は依然UNRESOLVED)。
+
+### 訂正(User指摘、2026-09-14)
+
+上記の「native自身のforget flowでは1以上、AddNewブリッジでは0のまま」という解釈は、今回のデータからは言えない。**High Pixie・Frostとも今回観測したのはAddNewブリッジ経路(`bridgeActive=True`)のみ**であり、確定している差はあくまで「High Pixie bridge = 1/2」対「Frost bridge = 0」である。native自身の通常forget flow(`bridgeActive=False`)との比較は行っていない。
+
+### 次: `[r13+0x10]`のwriter特定(2026-09-14、実装・build・deploy済み、runtime観測待ち)
+
+`r13`は`cmpDrawStatusComEx2`が毎回(ほぼ毎フレーム)新規に取得するオブジェクトであり(`R13LOOPBOUND-HIT`ログでunit=59/60ともpointer値が毎回異なることを確認済み。ただし両者とも同一ヒープ帯域(`0x1F1861...`〜`0x1F50EE...`)に収まっており、同種のオブジェクトであることは既存ログのみで確認できた)、静的アドレスへのhardware write breakpointは「オブジェクトが存在する前には仕掛けられない」という原理的な制約がある。
+
+`0x1800E6930`(r13を返す呼び出し先)を静的disassemblyしたところ、`jmp 0x1800B53C0`→`jmp 0x1800B53F0`という薄いtrampolineで、その先はIL2CPPの総称的な型解決・仮想/interfaceメソッド呼び出し解決の内部機構(`0x1800ADA10`/`0x1800AB8B0`/`0x1800A1D50`等)であることを確認した。ゲーム固有ロジックではなく、これ以上深追いしても意味論的な手がかりは得にくいと判断する。
+
+上記制約を踏まえ、以下を実装した(`src/SkillMutationV3/R13FetchAndWriteWatchTrace.cs`、read-only):
+
+- **DR0**(fixed execute): `cmpDrawStatusComEx2`の取得直後(VA`0x1822DB41A`、`mov [rsp+0x60],rax`)。この瞬間の`r13`(=RAX)と`[r13+0x10]`の値を記録し(=最も早い時点での観測値。ここで既に1/2なら、取得呼び出し自体の内部で値が決まっていることになる)、その場で**DR1を今フレームの`[r13+0x10]`へ動的に再設定**する。
+- **DR1**(dynamic write watch、1byte): 直前のDR0ヒットで設定されたアドレスへの書き込みを検知する。ヒット時、writerのRIP(runtime、ASLR未補正)と書き込み後の値を記録する。
+- **DR2**(fixed execute): `cmpDrawSkill`側の最終読み取り地点(VA`0x1822DA05E`、既存の`CmpDrawSkillR13LoopBoundTrace`と同一点)。1回のテストでfetch時点・write検知・最終読み取りの3点を同時に得られる。
+
+`src/ModMain.cs`: `CmpDrawSkillR13LoopBoundTrace.Tick()/FlushPendingLogs()`呼び出しを`R13FetchAndWriteWatchTrace`に差し替え(同一DR0-DR3を奪い合うため同時稼働不可)。`OnDeinitializeMelon`に`R13FetchAndWriteWatchTrace.Uninstall()`を追加。
+
+Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `e8fdd90f59334dadc7729150fa617cdbff3ca04d6a8ce9541d5bb41aa583c203`。
+
+ログ確認方法: `R13WRITEWATCH-INSTALLED`(導入確認)、`R13WRITEWATCH-FETCH; ...; r13=...; byteAtFetch=...;`(取得時点の値)、`R13WRITEWATCH-WRITE; ...; addr=...; byteAfterWrite=...; writerRipRuntime=...;`(書き込み検知、あれば)、`R13WRITEWATCH-LOOPREAD; ...; loopBound=...;`(既存traceと同じ最終値)を探す。`writerRipRuntime`が得られたら、`runtimeAddr - actualModuleBase + 0x180000000`でstatic VAへ補正してから逆アセンブルする(このmodの他probeと同じ手順)。
+
+### READY FOR PRODUCTION: NO(根本原因はCONFIRMED、修正実装はまだ)
+
+## NEXT(2026-09-14更新、writer特定build投入済み)
+
+1. **(次の本命、runtime、User担当)** `R13FetchAndWriteWatchTrace`をHigh Pixie・Frostそれぞれのhidden entry滞在中に実機投入し、`R13WRITEWATCH-FETCH`(最も早い時点の値)・`R13WRITEWATCH-WRITE`(writer捕捉、あれば)・`R13WRITEWATCH-LOOPREAD`(最終値)を比較する。特に、`byteAtFetch`の時点で既にHigh Pixie=1/2・Frost=0が分かれているか(=分岐が取得呼び出し自体の内部で決まっている)、それとも`R13WRITEWATCH-WRITE`が観測されるか(=取得後に何かが書き換えている)を確認する。
+2. writerが特定できたら、AddNewブリッジ側とnative自身の通常forget flow(bridgeActive=False)の双方でこの値がどう決まるかを比較し、修正PoCを検討する(User承認前提、まだ着手しない)。
+3. `CursorPos.InvisibleListNums`の実際の役割・更新タイミングを確認し、stale値仮説を検証する(優先度低)。
+4. await系(息吹の具足)ケースでも同じ計測を行い、同じ分岐点で説明できるか確認する。
+5. 修正方針はUser承認後に着手する。
 
 ## 現在の優先順位
 
