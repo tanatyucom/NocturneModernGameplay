@@ -425,9 +425,40 @@ Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModern
 
 ### READY FOR PRODUCTION: NO(根本原因はCONFIRMED、修正実装はまだ)
 
+## 次回再開地点(2026-09-14、git保全時点、User記録)
+
+### 次回最優先タスク
+
+User実機テストから再開する。
+
+- High Pixie成功ケース: hidden entry上で数秒待つ。
+- Frost失敗ケース: hidden entry上で数秒待つ。
+
+その後、`Latest.log`の以下を比較する:
+
+- `R13WRITEWATCH-FETCH`: `unit` / `bridgeActive` / `byteAtFetch`
+- `R13WRITEWATCH-WRITE`: old/new値 / writer VA / 発生有無
+- `R13WRITEWATCH-LOOPREAD`: final `loopBound`
+
+### 判定ツリー
+
+**Case 1**: High PixieがFETCH時点で1/2、FrostがFETCH時点で0、かつWRITEが観測されない
+→ 差は`r13`取得時点で既に成立している(取得後に壊されているのではない)。
+→ 次はstatic slot `0x182E46A50`が参照する候補/pendingリストを誰が構築・更新しているかを追う。
+
+**Case 2**: FETCH時点では両者同値だが、その後WRITEが発生する
+→ writer VAを本命としてstatic解析する。
+→ High Pixieでは誰が1/2を作り、Frostでは誰が(あるいは何が)0へ変更するかを追う。
+
+**Case 3**: High Pixieのみ0→1/2のwriterがあり、Frostでは同じwriterが一度も来ない
+→ 必要な候補リスト構築処理がFrostで発生していない可能性が高い。
+→ そのwriterを含む初期化処理全体を解析する。
+
+**重要**: まだ修正PoCには進まない。特に、`[r13+0x10]`だけを直接1へ書く修正は行わない。countだけでなく候補要素本体の初期化も必要な可能性が高いため、writer/構築処理の意味を確認してから修正方針を決める。
+
 ## NEXT(2026-09-14更新、writer特定build投入済み)
 
-1. **(次の本命、runtime、User担当)** `R13FetchAndWriteWatchTrace`をHigh Pixie・Frostそれぞれのhidden entry滞在中に実機投入し、`R13WRITEWATCH-FETCH`(最も早い時点の値)・`R13WRITEWATCH-WRITE`(writer捕捉、あれば)・`R13WRITEWATCH-LOOPREAD`(最終値)を比較する。特に、`byteAtFetch`の時点で既にHigh Pixie=1/2・Frost=0が分かれているか(=分岐が取得呼び出し自体の内部で決まっている)、それとも`R13WRITEWATCH-WRITE`が観測されるか(=取得後に何かが書き換えている)を確認する。
+1. **(次の本命、runtime、User担当)** `R13FetchAndWriteWatchTrace`をHigh Pixie・Frostそれぞれのhidden entry滞在中に実機投入し、上記判定ツリーに従って`R13WRITEWATCH-FETCH`/`R13WRITEWATCH-WRITE`/`R13WRITEWATCH-LOOPREAD`を比較する。
 2. writerが特定できたら、AddNewブリッジ側とnative自身の通常forget flow(bridgeActive=False)の双方でこの値がどう決まるかを比較し、修正PoCを検討する(User承認前提、まだ着手しない)。
 3. `CursorPos.InvisibleListNums`の実際の役割・更新タイミングを確認し、stale値仮説を検証する(優先度低)。
 4. await系(息吹の具足)ケースでも同じ計測を行い、同じ分岐点で説明できるか確認する。
