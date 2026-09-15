@@ -184,15 +184,37 @@ namespace NocturneModernGameplay
     }
 
     // Always priority (per this session's corrected spec): whenever
-    // PowerUp.Chance==Always AND bit6 was CLEAR entering this invocation
-    // (Repeat=Native only path in Phase A), ordinary Skill Power-Up wins
-    // over genuine Mutation - regardless of whether Mutation.Chance is
-    // Native or Always. The explicit user choice "Power-Up=100%" is treated
-    // as intent to see that Power-Up happen, so it outranks even a
-    // genuinely native Mutation trigger. When bit6 was SET, Repeat=Native
-    // means Power-Up cannot occur at all this cycle - this Postfix does
-    // nothing at all in that case, and whatever Mutation.Chance (Native/
-    // Always/Disabled) produced natively stands untouched.
+    // PowerUp.Chance==Always, ordinary Skill Power-Up wins over genuine
+    // Mutation - regardless of whether Mutation.Chance is Native or Always.
+    // The explicit user choice "Power-Up=100%" is treated as intent to see
+    // that Power-Up happen, so it outranks even a genuinely native Mutation
+    // trigger.
+    //
+    // bit6WasSet handling (2026-09-15 FIX, User-directed - see
+    // investigations/ACQUISITION_LEARNASNEW/PLAN.md "Option F / SkillPowerUp.
+    // Always regression" for the runtime evidence this fix responds to):
+    // when bit6 was SET entering this invocation, Repeat=Native means
+    // Power-Up cannot occur at all this cycle - this Postfix does nothing in
+    // that case, and whatever Mutation.Chance (Native/Always/Disabled)
+    // produced natively stands untouched (unchanged from Phase A). BUT under
+    // Repeat=Unlimited, bit6 being already SET does NOT mean "this cycle is
+    // over" - Repeat=Unlimited's whole purpose is to keep offering more
+    // Power-Up opportunities within the same level-up, and the Canonical
+    // spec (SkillPowerUp.Chance=Always + Repeat=Unlimited => only ordinary
+    // Power-Up ever surfaces, as long as a valid candidate exists) requires
+    // this same 2/3->1 priority conversion to keep applying on every
+    // subsequent roll too, not just the first. Root cause of the bug this
+    // fixes: Phase C (Repeat=Unlimited, OptionFRepeatUnlimitedControl.cs)
+    // was added without updating this Phase A bit6WasSet-skip condition to
+    // account for it - OptionFRepeatUnlimitedControl only ever converts
+    // rawResult==0 (R0-A/B/C), never rawResult==2/3, so nothing else in the
+    // codebase covers the "bit6 already SET, dil=1 RNG-bypass genuinely
+    // reaches Mutation with a nonzero raw result" case under Unlimited -
+    // CONFIRMED runtime observed (2026-09-15): unit=59, SkillPowerUp.Chance=
+    // Always + Repeat=Unlimited + SkillMutation.Chance=Native, 5/5 successful
+    // outcomes this session were native rawResult==2 (Mutation), 0/5 were
+    // rawResult==1, with bit6WasSet==True on every OPTION-F-DECISION log for
+    // this unit in the same session.
     //
     // Prefix/Postfix pairing follows the same "_captured guard" pattern
     // already established by RepeatableSkillPowerUp.cs (CapturePrefix /
@@ -228,7 +250,10 @@ namespace NocturneModernGameplay
             if (SkillPowerUpChanceControl.Mode != NativeChanceMode.Always || !_captured) return;
             _captured = false; // consume once per Prefix/Postfix pair
 
-            if (_bit6WasSet) return; // Repeat=Native: already power-upped this cycle - defer entirely
+            // Repeat=Native: already power-upped this cycle - defer entirely.
+            // Repeat=Unlimited: bit6 already being SET does not end the
+            // cycle - keep converting (see class-level comment above).
+            if (_bit6WasSet && GameplaySettingsService.Repeat != "Unlimited") return;
 
             try
             {

@@ -464,6 +464,407 @@ User実機テストから再開する。
 4. await系(息吹の具足)ケースでも同じ計測を行い、同じ分岐点で説明できるか確認する。
 5. 修正方針はUser承認後に着手する。
 
+## CONFIRMED(2026-09-15、実機ログ解析 — writer関数の特定と判定ツリー確定)
+
+前回セッションで実装・deploy済みの`R13FetchAndWriteWatchTrace`のログ(`Latest.log`、`07:50:24〜`、High Pixie=unit59、Frost=unit60、`bridgeActive=True`かつ`target=8`のみ集計)を解析した。
+
+### FETCH/WRITE/LOOPREAD集計
+
+```
+FETCH byteAtFetch: unit59=0(215/215)、unit60=0(206/206)  ← 両者とも完全同値
+LOOPREAD loopBound: unit59=1(20件)/2(195件)、unit60=0(205件)/1(1件、後述)
+WRITE件数: unit59=625件、unit60=207件
+```
+
+WRITEのwriterRipRuntime(→静的VA変換、`moduleBase=0x7FFF68480000`実測値を使用)は両者とも同じ2箇所に収束した:
+
+```
+writer1 = 0x1822804BD (byteAfterWrite=0、毎フレーム無条件、両者とも100%出現)
+writer2 = 0x1822805FF (byteAfterWrite=1→2、増分。unit59は215件中215件出現・うち195件は2回目まで到達。unit60は206件中たった1件のみ)
+```
+
+**判定**: FETCH時点は両者完全同値(0)であり、その後WRITEで分岐する。**判定ツリー上はCase 2**(FETCH時点で差がない→writer VAを特定)に該当。ただし実際の分岐パターンはCase 3の記述(「High Pixieのみ増分writerが来る、Frostでは来ない」)にほぼ一致する。unit60の1/206件(frame=7159、`seq=22`、境界フレーム)は、前回のgate cascade調査で既に記録済みの「seq21→22遷移境界での取りこぼしノイズ」と同型であり、安定した成功例とは解釈しない。
+
+### writer関数の特定: `rstcalc.rstCreateBeforeSkillList`(VA `0x182280460`〜`0x182280820`)
+
+IL2CPPメタデータの管理メソッドテーブルを機械的に走査した結果(`.analysis/scratch_find_func_start_r13writers.py`)、writer1・writer2とも**同一関数**`rstcalc.rstCreateBeforeSkillList`の内部にあることが確定した(writer1はエントリから`0x5D`バイト、writer2は`0x19F`バイト)。この関数は本investigationの前段(line 127付近、2026-09-14)で「`cmpDrawStatusComEx2`が呼んでいる、pending候補を含むskill listの構築に関わる関数」として既に言及されていたものと一致する。
+
+`0x182280460`〜`0x182280820`を全体逆アセンブルした(`.analysis/disasm_rstcreatebeforeskilllist_full.py`)。関数シグネチャは概ね`rstCreateBeforeSkillList(byte modeFlag /*rcx→r14*/, StockObj* pStock /*rdx→r15*/, ushort levelParam /*r8w→r12d*/, ListObj* outList /*r9→rsi*/)`(static/非仮想)。
+
+- `mov byte ptr [rsi+0x10], 0`(`0x1822804B9`、writer1の実アドレスはこの1命令前): `outList.count`(=我々が追跡している`[r13+0x10]`と同一フィールド)を毎回0にリセットしてからループ開始。
+- `ebx=0..0x18(24)`のループで、`pStock`の"curriculum"的な配列(`[rdi+0x18]`、要素はポインタ配列、strideは8)を24スロットまで走査する。
+- ループ本体でのゲート:
+  1. **tag一致**: `byte[entry+0x11] == 6`(`word[r15+0x88]!=0`の場合)または`== 1`(それ以外)。不一致ならこのebxはスキップ。
+  2. **レベル閾値**: `sbyte[entry+0x10] > word[r15+0x24] + levelParam` (`ebp > ecx`)。満たさなければスキップ。
+  3. **所持済みチェック**: `call 0x182410660(pStock=r15, skillId=word[entry+0x12], flag=0)`の戻り値(AL)が**負(sign bit=1)**であることが必要。`>=0`ならスキップ。
+- 上記3ゲート全通過時のみ、`outList.byteArray[count]=entry[+0x10]`(`0x1822805EB`)と`outList.wordArray[count]=skillId`(`0x182280611`)を書き込み、`outList.count++`(writer2の実アドレス`0x1822805FC`)。
+- **なお`bx(=[r15+0x14]、curriculum残数)==0`の場合は上記ループ自体に入らず別分岐(`0x182280641`〜、固定8スロット・skillID`0x165`固定検索)へ飛ぶが、今回のログでは両unitともこの別分岐のwriteは一度も観測されなかった(`writerRipRuntime`は終始上記2値のみ)。したがって「curriculum残数が0だから」という説明(第三比較ケースの仮説)は今回のHigh Pixie/Frostの差の直接原因ではない**。両者ともcurriculumは残っているが、ループ内の24候補のうち何個が3ゲートを通過するかが異なっている。
+
+### 次のruntime観測点(実装・build・deploy済み、User実機テスト待ち)
+
+`R13FetchAndWriteWatchTrace.cs`にDR3(4本目のhardware execute breakpoint、既存DR0/DR1/DR2はそのまま維持)を追加した。
+
+- 観測点: `0x1822805CC`(`test al,al`、ゲート3=所持済みチェックの`call`直後)。この地点に到達した時点で既にゲート1(tag)・ゲート2(レベル閾値)は通過済みであることが確定している。
+- 記録内容: `ebx`(候補スロット番号0〜23)、`skillId`(`r14w`、候補スキルID)、`gate3Al`(所持済みチェックの生の戻り値、符号付き)、`appended`(`gate3Al<0`から導出、実際にリストへ追加されたか)。
+- ログ行: `R13WRITEWATCH-GATE3; frame=...; seq=...; bridgeActive=...; unit=...; target=...; ebx=...; skillId=...; gate3Al=...; appended=True/False.`
+
+これにより次のテストで判別できること:
+- Frostで`R13WRITEWATCH-GATE3`が**1件も出ない** → 24候補全てゲート1(tag)またはゲート2(レベル閾値)で落ちている(=Frostのcurriculumにはそもそも「該当tagかつ現在レベルを超える」候補が無い)。
+- Frostで`R13WRITEWATCH-GATE3`は出るが**`gate3Al`が常に`>=0`(`appended=False`)** → ゲート1・2は通過するが、ゲート3(所持済みチェック)で毎回弾かれている(=候補スキルを全て「既に持っている」と判定されている)。
+- 上記いずれの`skillId`がHigh Pixie側の実際に追加された候補(既存`R13WRITEWATCH-WRITE`ログと相関、`writer2`発火時の値)と一致・不一致するかも比較する。
+
+Clean build: error 0、warning 9(既存のみ、今回の変更と無関係)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `cf16b83ecd1c4aaece1c8d007b54ccb3477404577eb5b8bb1d88851fc980830e`。
+
+**まだ修正PoCには進んでいない**。`[r13+0x10]`(=`outList.count`)を直接書き換える修正、および候補要素本体(`outList.byteArray`/`wordArray`)を伴わない修正はいずれも見送っている。
+
+### 次回のUser実機テスト依頼内容
+
+High Pixie成功ケース・Frost失敗ケースそれぞれでhidden entry上に数秒滞在し、`Latest.log`の`R13WRITEWATCH-GATE3`行(`bridgeActive=True`、`unit=59`/`60`、`target=8`で絞り込み)を比較する。
+
+## CONFIRMED(2026-09-15、実機ログ解析 — ゲート3は原因ではないと確定)
+
+上記で実装・deploy済みの`R13WRITEWATCH-GATE3`ログ(`Latest.log`、`08:11:20〜`)を解析した結果:
+
+```
+bridgeActive=True、target=8でのGATE3ヒット数:
+  unit=59(High Pixie): 332件、全件appended=True(gate3Al=-1)
+  unit=60(Frost)      : 1件のみ(frame=8109、seq=22、境界フレーム、appended=True)
+```
+
+High Pixie側は候補スロットが2つに安定している:
+
+```
+ebx=10 -> skillId=353 (156件、全てappended=True)
+ebx=12 -> skillId=72  (175件、全てappended=True)
+ebx=6  -> skillId=349 (1件のみ、遷移フレームと推定)
+```
+
+**結論**: Frostはgate3(所持済みチェック)に**ほぼ到達すらしていない**(332対1、しかもその1件も既知の境界ノイズと同型)。到達した場合は両unitとも常に`appended=True`(gate3は一度も候補を弾いていない)。したがって**gate3(所持済みチェック)はFrost失敗の原因ではない**。真の分岐点はgate1(tag一致)かgate2(レベル閾値)のどちらか、24候補中のどのebxでも通過していないことにある。
+
+## 実装・build・deploy(2026-09-15、CurriculumGateChainTrace — gate1/gate2切り分け)
+
+`R13FetchAndWriteWatchTrace`のFETCH/WRITE(dynamic write-watch)機構は「writerは誰か」という当初の問いに既に答え終えたため撤去し、代わりに`CurriculumGateChainTrace.cs`(新規)を実装した。3本とも固定アドレスのhardware execute breakpointのみ(dynamic reprogramming不要、DR0-DR2使用、DR3空き):
+
+- **LoopReadVa**(`0x1822DA05E`、既存踏襲): 最終`loopBound`のクロスチェック用に維持。
+- **Gate1PassVa**(`0x1822805B4`、新規、`cmp ebp,ecx`): gate1(tag一致)を通過した直後の地点。到達した時点でtagは既にmatch済みであることが確定する。この瞬間`rdx`=候補curriculumEntryへのポインタであることを利用し、`ebx`/`skillId`(`[rdx+0x12]`)/`tag`(`[rdx+0x11]`)/`levelThresh`(`[rdx+0x10]`)/`levelBase`(その時のecx)を直接メモリから読み取って記録する。
+- **GateCheckVa**(`0x1822805CC`、既存踏襲): gate3(所持済みチェック)の結果、そのまま維持。
+
+判定方法(オフラインで`ebx`ごとに集計): 24候補(`ebx=0..23`)のうち、
+- どちらのログにも出ないebx → gate1(tag)で落ちている。
+- `Gate1Pass`には出るが`GateCheck`には出ないebx → gate1通過・gate2(レベル閾値)で落ちている。
+- 両方に出るebx → gate1・gate2通過、gate3結果は`appended`フィールド通り(前セクションの通り常にTrue)。
+
+ModMain.csの呼び出しを`R13FetchAndWriteWatchTrace.Tick()/FlushPendingLogs()`から`CurriculumGateChainTrace.Tick()/FlushPendingLogs()`へ切り替えた(同一DR0-DR3を奪い合うため同時稼働不可、これまでと同じ制約)。`OnDeinitializeMelon`に`CurriculumGateChainTrace.Uninstall()`を追加。
+
+Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `28ad7dfc4793b1bbceabb04b6523621badb2179199bfdad2d8ddf1b51ffc7161`。
+
+ログ確認方法: `CURRICULUMGATE-INSTALLED`(導入確認)、`CURRICULUMGATE-GATE1PASS; frame=...; seq=...; bridgeActive=...; unit=...; target=...; ebx=...; skillId=...; tag=...; levelThresh=...; levelBase=...;`、`CURRICULUMGATE-GATE3; ...(既存と同形式)`、`CURRICULUMGATE-LOOPREAD; ...(既存と同形式)`を探す。`bridgeActive=True`かつ`target=8`かつ`unit=59`/`60`で絞り込み、`ebx`ごとにHigh Pixie/Frostの`GATE1PASS`出現有無を比較する。
+
+**まだ修正PoCには進んでいない。**
+
+### 次回のUser実機テスト依頼内容
+
+High Pixie成功ケース・Frost失敗ケースそれぞれでhidden entry上に数秒滞在する。`CURRICULUMGATE-GATE1PASS`行がFrost側で1件でも出るか(→gate1は通る、gate2で落ちている)、それとも皆無か(→gate1で落ちている)を確認する。
+
+## CONFIRMED(2026-09-15、実機ログ解析 — 根本原因確定: `pStock[+0x88]`によるcurriculumサブリスト分岐)
+
+`CurriculumGateChainTrace`の実機ログ(`Latest.log`、`08:22:25〜`)を解析した。
+
+### gate1(tag)は両unitとも通っている — gate1は原因ではない
+
+```
+GATE1PASSヒット数(bridgeActive=True、target=8):
+  unit=59(High Pixie): 947件
+  unit=60(Frost)      : 1238件  ← Frostの方がむしろ多い
+```
+
+**gate1(tag一致)はFrostでも普通に通過している。gate1はFrost失敗の原因ではない。**
+
+### 決定的な違い: `[r15+0x88]`(pStockのフィールド)の値そのものが違う
+
+`ebx`/`skillId`/`tag`/`levelThresh`/`levelBase`の組み合わせを集計した結果:
+
+```
+High Pixie(unit=59)の安定候補(165〜188サンプル、tag=6のグループ):
+  ebx=3  skillId=47  tag=6 levelThresh=11
+  ebx=6  skillId=44  tag=6 levelThresh=12
+  ebx=8  skillId=396 tag=6 levelThresh=13
+  ebx=10 skillId=353 tag=6 levelThresh=14
+  ebx=12 skillId=72  tag=6 levelThresh=15
+  (levelBase=13または14。levelThresh > levelBaseを満たすのはebx=10・12のみ → gate3へ到達 → 既存GATE3ログと一致)
+  ※tag=1のグループもebx=0〜6で各1件だけ出現(単発の遷移フレームと推定)
+
+Frost(unit=60)の安定候補(156〜176サンプル、**全てtag=1**):
+  ebx=0 skillId=7   tag=1 levelThresh=0
+  ebx=1 skillId=412 tag=1 levelThresh=0
+  ebx=2 skillId=301 tag=1 levelThresh=0
+  ebx=3 skillId=10  tag=1 levelThresh=8
+  ebx=4 skillId=400 tag=1 levelThresh=9
+  ebx=5 skillId=180 tag=1 levelThresh=10
+  ebx=6 skillId=349 tag=1 levelThresh=11
+  (levelBase=11または12。levelThresh > levelBaseを満たすものが1件も無い → 全滅)
+  ※tag=6のグループはFrostでは一度も出現しなかった
+```
+
+**結論(CONFIRMED)**: `rstCreateBeforeSkillList`内のゲート1分岐(`word[r15+0x88]!=0`なら`tag==6`グループ、`==0`なら`tag==1`グループを走査)は、High Pixieでは**安定して`[r15+0x88]!=0`**(tag=6グループ = より高いlevelThreshold(11〜15)を持つ「今後習得予定」の候補群)を走査しているのに対し、Frostでは**安定して`[r15+0x88]==0`**(tag=1グループ = levelThresholdが0または現在レベル以下(0,0,0,8,9,10,11)の「既に到達済み/通過済み」候補群)を走査している。tag=1グループのlevelThresholdは構造的に全て`levelBase`以下であるため、gate2(`levelThresh > levelBase`)を1件も満たせない。
+
+**これがFrost失敗の根本原因である**: gate1・gate3はボトルネックではなく、`[r15+0x88]`という1つのフラグ/フィールドの値の違いが、走査対象のcurriculumサブリストそのものを「今後習得予定(tag=6)」から「既に通過済み(tag=1)」へ切り替えてしまい、結果としてgate2で全滅する。
+
+**なお、`HIDDEN9THGATE-HIT`ログ(2026-09-14、`Hidden9thGateCascadeTrace`、checkpoint3「gate6Pass(field0x88!=null)」)に同じ`0x88`という数値が登場するが、これは別のオブジェクト(`cmpDrawSkill`側のr13相当)に対する既存の別チェックであり、今回の`pStock[+0x88]`と同一フィールドかどうかは未確認。安易に同一視しないこと。**
+
+### 未解決(次の焦点)
+
+`pStock(r15)+0x88`が具体的に何を表すフィールドか(型・意味論)が未特定。仮説:
+- 「まだ消化していない自然LvUp候補が残っているか」を示すフラグ/カウント/ポインタ。
+- AddNewブリッジが一時的に`pStock`の内部状態を書き換えており、Frostの場合はブリッジ処理の過程でこのフィールドがクリアされてしまっている可能性。
+
+次の調査候補(未着手、User承認前提):
+1. `[r15+0x88]`自体の値(0/非0、または実際のポインタ/カウント値)をHigh Pixie/Frostで直接ログするtraceを追加する(rstCreateBeforeSkillListの冒頭、`0x182280500`付近に1点)。
+2. `[r15+0x88]`のwriter(誰がいつこのフィールドを設定・クリアするか)を特定する。native自身の通常forget flow(`bridgeActive=False`)とAddNewブリッジ経路の双方で比較する。
+3. `pStock`構造体自体の型・他フィールドとの対応(IL2CPPメタデータでの型名解決)を試みる。
+
+**まだ修正PoCには進んでいない。**
+
+## 実装・build・deploy(2026-09-15、User仮説の検証 — `[r15+0x88]`==`hensinmae`確認用プローブ)
+
+User指摘: 本プロジェクトが既に持っている`datUnitWork_s`(cpp2il実機dump、`.analysis/cpp2il_cs/DiffableCs/Assembly-CSharp/newdata_H/datUnitWork_s.cs`)のフィールド対応を確認したところ、以下が確定した(cpp2ilメタデータそのものを直接参照、静的に100%確実):
+
+```csharp
+public uint flag;          // 0x10
+public ushort id;          // 0x14
+...
+public ushort level;       // 0x24
+...
+public int skillcnt;       // 0x48  (01_CURRENT_STATE.mdで既に別investigationからCONFIRMED済み)
+public Int32[] skill;      // 0x50
+...
+public ushort hensinmae;   // 0x88  ← 今回の[r15+0x88]と一致する可能性
+public UInt16[] getdevilhearts; // 0x90
+public uint hensinmaeexp;  // 0x98
+```
+
+**`r15`がpStock(`datUnitWork_s*`)であることの裏付け(静的、cpp2ilメタデータ照合)**:
+- `rstCreateBeforeSkillList`内で`[r15+0x14]`(前セクションで「curriculum件数」と暫定していた値)は実は`movzx`(ushort読み)であり、`datUnitWork_s.id`(ushort、0x14)と型・オフセットとも完全一致。
+- `[r15+0x24]`(levelBaseとして使っていた値)も`movzx`(ushort読み)であり、`datUnitWork_s.level`(ushort、0x24)と完全一致。
+- `[r15+0x88]`も同じく`movzx`(ushort読み)であり、`datUnitWork_s.hensinmae`(ushort、0x88)と型・オフセットが完全一致。
+- 3つの独立したushortフィールドが全て一致しており、`r15 == pStock`である可能性が非常に高い。
+
+**Userの仮説**: `hensinmae`(変身前)は「合体で進化する前の元の種族ID」を保持するフィールドであり、ハイピクシー(妖精系から変化した悪魔)は`hensinmae != 0`、フロスト(通常個体)は`hensinmae == 0`という構造的な違いがあるはず。これがtag=6/tag=1分岐の実体であれば、**「Frostが壊れている」のではなく「native側がそもそも変化元情報(hensinmae)の有無でcurriculum参照先を切り替える仕様であり、High Pixieは変化悪魔だからたまたま9番目枠のnative表示経路に乗れていた」**という解釈になる。この場合、`[r15+0x88]`のwriterを追ってMOD側で非0にする方向(hensinmaeは悪魔固有状態であり改変対象ではない)には進まない。
+
+### 実装
+
+`CurriculumGateChainTrace.cs`に4本目のhardware execute breakpoint(`StockFieldProbeVa`、`0x182280480`、関数冒頭`r15`確定直後)を追加した。`[r15+0x14]`(id)/`[r15+0x24]`(level)/`[r15+0x48]`(skillcnt)/`[r15+0x88]`(hensinmae候補)を1回のヒットで同時記録し、既存の`_cachedUnit`(managed側`GBWK.pCurrentStock.id`)と併記してログ出力する。
+
+ログ行: `CURRICULUMGATE-STOCKFIELDS; frame=...; seq=...; bridgeActive=...; unit=...; target=...; r15=0x...; stockId=...; stockLevel=...; stockSkillCnt=...; stockHensinmae=....`
+
+確認予定:
+1. `stockId`が既存の`unit`(managed `stock.id`)と一致するか(`r15==pStock`の直接runtime裏付け)。
+2. `stockSkillCnt`が妥当な値(既存の所持スキル数、0〜8程度)か。
+3. High Pixie(`stockHensinmae`)とFrost(`stockHensinmae`)の生値を比較(Frostは0、High Pixieは非0の具体的な種族ID相当の値であることを期待)。
+
+Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `eda951997c598c4ed586ec936bdf39a43aa3270a90d88c29db5bc24de3b55364`。
+
+**まだ修正PoCには進んでいない。`[r15+0x88]`(hensinmae候補)のwriterを非0化する方向へは進まない(User指摘通り、確定するまで検討しない)。**
+
+### 次回のUser実機テスト依頼内容
+
+High Pixie成功ケース・Frost失敗ケースそれぞれでhidden entry上に数秒滞在する。`CURRICULUMGATE-STOCKFIELDS`行の`stockId`/`stockLevel`/`stockSkillCnt`/`stockHensinmae`を比較し、上記3点を確認する。
+
+## CONFIRMED(2026-09-15、実機テストで`hensinmae`仮説が的中)
+
+`CURRICULUMGATE-STOCKFIELDS`ログ(`08:34:15〜`)を解析した:
+
+```
+High Pixie(unit=59): stockId=59(190件、managed側unitと完全一致) stockLevel=13 stockSkillCnt=8 stockHensinmae=61
+Frost(unit=60)      : stockId=60(187件、managed側unitと完全一致) stockLevel=11 stockSkillCnt=8 stockHensinmae=0
+```
+
+**確定**: `stockId`がmanaged側`unit`と1件のブレもなく完全一致 → `r15 == pStock(datUnitWork_s*)`はもはや推測ではなく直接runtime裏付け済み。`stockHensinmae`はHigh Pixie=61(非0)、Frost=0で安定。**User仮説「`[r15+0x88]`=`hensinmae`」的中**。
+
+**結論の反転**: 「Frostが壊れている」のではなく、「High Pixieは変化悪魔(`hensinmae!=0`)だから、nativeが元々持つ`tag=6`側(今後習得予定)curriculumグループを見られ、たまたま9番目presentation pathが成立していた」。Frost(通常個体、`hensinmae==0`)は構造的に`tag=1`側(現在レベル以下の消化済み候補)しか見えず、gate2で必ず全滅する。`hensinmae`は悪魔固有データであり、writer追跡・改変は行わない(User指摘通り)。
+
+**次の本命(User指定)**: `hensinmae`ではなく、「AddNew bridgeがpending targetをnativeの9番目presentation pathへどう供給するか」の設計フェーズへ移行。方針候補は2つ、Userの第一候補は「native `outList`を再利用し、bridge側から正しく1件だけ供給してnative側の描画・ハイライト・入力に任せる」。ただし`outList.count=1`だけ書く修正は禁止(候補要素本体の初期化も必要)。
+
+## CONFIRMED(2026-09-15、静的解析 — `outList`構造の完全把握、修正設計フェーズ着手)
+
+Userの指示で、書き込み側(`rstCreateBeforeSkillList`)に加えて消費側(`cmpDrawSkill`)の`outList`(`r13`)アクセスを全数洗い出した(`.analysis/disasm_cmpdrawskill_outlist_consumer.py`で範囲disasm、`.analysis/disasm_cmpdrawskill_full_r13_refs.py`で`cmpDrawSkill`全体(`0x1822D97C0`〜`0x1822DB3A0`、1663命令)を走査して`r13`を含む命令のみ抽出)。
+
+### 1. `outList+0x18`(byte[]、levelThresh/type)の用途
+
+**`cmpDrawSkill`全体(1663命令)を走査した結果、`r13`への参照は13箇所のみ、そのうち`[r13+0x18]`への参照は0件だった。** `cmpDrawSkill`はこの screen の唯一生存する描画チェーンであることが既にCONFIRMED済み(前セクション、`cmpDrawStatus`/`cmpStatus`クラス全体の逆アセンブル済み)なので、**「hidden/9th-slot presentation」に限って言えば`outList+0x18`(levelThresh/typeバイト)は表示に一切使われていない**と高い確度で言える。
+
+`r13`(outList)への13箇所の参照内訳:
+- `push/pop r13`(呼び出し規約、無関係)×2
+- `lea eax,[r13+0x13b]`/`[r13+0x13c]`(別の完全に無関係な計算、`r13`はこの箇所ではレジスタとして別目的で再利用されている定数畳み込みの産物、`outList`とは無関係)×2
+- `mov r13,[rsp+0xe0]`(ループ先頭でのスタックからの再読込、`outList`本体) ×1
+- `test r13,r13`(既知のLoopReadVa) ×1
+- `movsx ebx, byte ptr [r13+0x10]`(count読み取り、既知) ×1
+- `mov rax, qword ptr [r13+0x20]`(skillId配列取得) ×4
+- `lea ecx,[r12+r13]`(別の完全に無関係な計算) ×2
+
+### 2. `outList+0x20`(skillId配列)の用途— 4箇所全て確認
+
+- `0x1822DA395`(target==8ゲート内、既知): `word[rax+r14*2+0x20]`をスキルID`0x165`と比較するゲート。
+- `0x1822DA4C5`(target==8専用presentation block内、新規確認): 配列を取得後`test [rax+0x18],0; jbe <非活性化>`(空チェック)、続けて`0x1822DA4DC`で**固定インデックス0**(`word ptr [rax+0x20]`、乗数無し)を読み**表示用アイコン/テキスト解決(`call 0x1827c0a90`)に渡す**。→ **9番目枠の表示は常に`skillIdArray[0]`のみを見る**。
+- `0x1822DA650`(target!=8、通常0..N-1ループ内、既知): `word[rax+r14*2+0x20]`を現在の走査index(r14)で読み、通常枠の表示に使用。
+- `0x1822DA75A`(target!=8ブロックの別config分岐、新規確認、`0x1822DA650`と対のペア): 同様に`word[rax+r14*2+0x20]`を読む。
+
+**結論**: 9番目枠(hidden entry)の表示に必要なのは`outList.count>=1`と`outList.skillIdArray[0]`の2つだけ。`outList.byteArray`(levelThresh/type)はこの画面では未使用。
+
+### 3. `rstCreateBeforeSkillList`が1件追加する際の完全なwrite setと順序(byte-exact、既存の全体disasmより再整理)
+
+```
+1. byteArray[count]   = bpl (levelThresh, entry+0x10の生byte)   VA 0x1822805EB
+2. outList.count      = count + 1                                VA 0x1822805FC
+3. wordArray[oldCount] = skillId (entry+0x12のword)               VA 0x182280611
+```
+
+**順序に注意: `count`の増分は2つの配列書き込みの"間"で発生する(先にbyteArray、次にcount++、最後にwordArray)。** 他のside fieldへの書き込みは無い(この3命令のみが候補追加時のフットプリント全て、byte-exact disassembly上で確認済み)。
+
+### 4. 配列容量(Length)確認 — 実装・build・deploy済み、runtime確認待ち
+
+既存の`CURRICULUMGATE-LOOPREAD`(DR0、`0x1822DA05E`、毎フレーム発火・count=0のFrostでも発火する)のhandlerを拡張し、新規のhardware breakpointを追加せずに`[r13+0x18]`(byteArrayポインタ)・`[r13+0x20]`(wordArrayポインタ)と、それぞれのIL2CPP配列Lengthヘッダ(`[ptr+0x18]`)を同時記録するようにした。
+
+ログ行: `CURRICULUMGATE-LOOPREAD; frame=...; seq=...; bridgeActive=...; unit=...; target=...; r13=0x...; loopBound=...; byteArrayPtr=0x...; byteArrayLen=...; wordArrayPtr=0x...; wordArrayLen=....`
+
+これによりFrost(`count=0`)でも配列自体が有効か(非null・十分なLength)を直接確認できる。
+
+Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `6fa807dba0b3b6e6ff7dbe8f49fbe5bdda78032739eb922046e9182d6314947f`。
+
+**まだ修正PoCには進んでいない。**
+
+### 次回のUser実機テスト依頼内容
+
+High Pixie成功ケース・Frost失敗ケースそれぞれでhidden entry上に数秒滞在する。`CURRICULUMGATE-LOOPREAD`行の`byteArrayLen`/`wordArrayLen`を比較し、(a)Frostの`count=0`時でも配列自体は非null・十分な容量か、(b)両unitで同じ容量か、を確認する。
+
+## CONFIRMED(2026-09-15、実機テストで容量確認完了、設計材料が出揃った)
+
+```
+High Pixie: byteArrayLen=24 wordArrayLen=24 (220件、ブレなし)
+Frost     : byteArrayLen=24 wordArrayLen=24 (143件、count=0時でもブレなし)
+```
+
+Frostの`count=0`時点でも配列自体は非null・容量24で常に有効。両unitで容量完全一致。**新規IL2CPP配列確保は不要、既存配列のindex 0にそのまま書き込めば良いことが確定した。**
+
+これで3点(`+0x18`未使用/`+0x20`はindex0固定読み/writer write-set)+配列容量の計4点が出揃い、PoC設計に必要なEvidenceが完了した。
+
+## 実装(2026-09-15、PoC — `HiddenSlotCandidateInjectionPoc.cs`、専用ファイルとして分離)
+
+Userの設計方針(native `outList`を再利用し、bridge側から正しく1件供給してnativeのtarget==8 presentation pathにそのまま任せる)に基づき実装した。`AddNewHighlightCorrection.cs`とは意図的に別ファイル(別問題・別native関数・別リスクプロファイル)。
+
+**発見: 同一native関数(`rstcalc.rstCreateBeforeSkillList`)への既存Harmonyパッチが既に存在した**(`OptionFRepeatUnlimitedControl.cs`の`OptionFRepeatUnlimitedExclusionObserver`、Option F機能用)。パラメータ名`pStock`/`pInfo`での named binding はこのコードベースでは信頼できないという既存の教訓(コメント「interop assemblyの実パラメータ名は未確認」)に倣い、**位置引数(`__1`=pStock、`__3`=pInfo)方式**で実装した。Harmonyは同一メソッドへの複数`[HarmonyPatch]`クラスを問題なく併用できるため、既存パッチとは競合しない。
+
+型は`Il2Cppnewdata_H.datUnitWork_t`/`Il2Cppresult2_H.rstSkillInfo_t`(cpp2ilの元namespace`newdata_H`/`result2_H`がinterop assemblyでは`Il2Cppnewdata_H`/`Il2Cppresult2_H`という単一identifierにフラット化される、このコードベース既存の慣習と一致)。
+
+### 発火条件(Postfix、native実行完了後)
+
+```
+1. FullCapacityAddNewBridgeState.Active
+2. GBWK.SeqInfo.Current == 21 (forget/select presentation中のみ、22は対象外)
+3. FullCapacityAddNewBridgeState.Target != 0 (pending target skillId、EventParamではなくbridge state自体をsourceにした、User指摘通り)
+4. pStock.id == FullCapacityAddNewBridgeState.WatchedUnit
+5. pInfo.SkillCnt == 0 (native自身が既に候補を見つけている場合は一切干渉しない)
+6. pInfo.TargetLevel / pInfo.SkillID とも非null、Length>=1
+```
+
+### 書き込み順序(User指摘通り、nativeと同一順序には拘らず、要素を先に確定してから最後にcountを公開)
+
+```
+1. TargetLevel[0] = 0 (プレースホルダ、cmpDrawSkillからは未読と確認済み)
+2. SkillID[0] = (ushort)target
+3. SkillCnt = 1  ← 最後に公開、master gateなのでこの瞬間にpresentation blockが成立する
+```
+
+### 自己クリーンアップ(実装不要、構造的に保証される)
+
+writer1(`rstCreateBeforeSkillList`自身の`SkillCnt=0`無条件リセット、毎呼び出し・両unit100%で既にCONFIRMED済み)が、このPostfixより先に毎回走る。このPostfixは`Active`かつ`SkillCnt==0`のときだけ注入するため、bridgeが終了(`Active=false`)またはseqが21を離れた瞬間、次のnative呼び出しは自前のリセット後にこのPostfixの発火条件を満たさなくなり、注入した状態は一切残らない。別途cleanupコードは実装していない(User提案の「保証できるなら自然に上書きされる」に該当すると判断)。
+
+Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `7e30dd72d7b148443f452c607d43f6435d94bfca371d8a0152487aff82d8c564`。
+
+**`hensinmae`・curriculum構築ロジック・native writerはいずれも未改変。この Postfix のみが新規コード。**
+
+### 次回のUser実機テスト依頼内容(PoC検証、User提示の成功判定基準)
+
+Frostで満杯8枠からのSkill Power-Up AddNewブリッジを発生させ、forget UIのhidden entry(9番目枠)に数秒滞在する:
+
+```
+期待されるログ: HIDDENSLOT-INJECT; frame=...; unit=60; target=<pending skill名>; ...
+
+期待される実機挙動:
+- hidden entryの名前・アイコンが見える(今までは何も見えなかった)
+- カーソルをhidden entryに合わせるとハイライト枠が表示される
+- その状態で決定すると、正しくtarget skillを習得する(従来の論理選択・説明文表示は既に機能していた部分と整合)
+```
+
+同時に、この変更がHigh Pixie側(元々成功していたケース)や、Frost以外の通常のPower-Up/Mutationフローに悪影響を与えていないことも確認する(`pInfo.SkillCnt!=0`のケースには一切干渉しないため、理論上は無関係のはずだが実機で確認)。
+
+## CONFIRMED(2026-09-15、実機テストでPoC成功 — hidden entry問題は解決)
+
+`Latest.log`(`09:28:16〜`)で確認:
+
+```
+HIDDENSLOT-INJECT; frame=29125〜29216(以降も継続); unit=60; target=299:"会心"; targetLevelLen=24; skillIdLen=24.
+(567件、warning/error無し)
+
+FULLCAP-ADDNEW-COMPLETE; unit=60; finalSkills=[7,412,301,13,1,10,180,299,...]; sourcePreserved=True;
+targetPresent=True; skillcnt=8.
+```
+
+Frostのhidden entry(9番目枠)に名前・アイコン・ハイライトが表示され、決定操作で`target=299(会心)`を正しく習得(`targetPresent=True`)。同ログ内でHigh Pixie(unit=59)側の`FULLCAP-ADDNEW-COMPLETE`も正常(`targetPresent=True`)、既存の成功ケースへの回帰無し。
+
+**READY FOR PRODUCTION: 実機1回分のconfirmationとしてはYES。** ただし以下は今後の継続確認事項として残る(即座のブロッカーではない):
+
+- 今回確認できたのはFrost(`hensinmae==0`)1体、pending target 1種類(`299:会心`)の組み合わせのみ。他ユニット・他skillでの追加確認は未実施。
+- `PlaceholderTargetLevel=0`(`TargetLevel[0]`に書く値)は「`cmpDrawSkill`からは未読」という限定的な確認に基づく安全値。他の未特定consumerが存在しないかは依然UNRESOLVED(既存コメントに明記済み)。
+- 長時間の連続operation(複数回のforget/select往復、キャンセル→再突入等)でのリーク・不整合は今回未検証。
+
+## 実装(2026-09-15、production化フェーズ1 — 命名・ログ抑制・診断trace整理)
+
+User指示に基づき以下を実施:
+
+1. **命名**: `HiddenSlotCandidateInjectionPoc.cs` → `HiddenSlotCandidateInjection.cs`(クラス名も同様)。他の卒業済み修正(`AddNewHighlightCorrection.cs`等)と同じ「Poc」無し命名規則に統一。
+2. **ログ抑制**: `HIDDENSLOT-INJECT`を毎フレーム(実機で567件/セッション観測)から**episode単位でlog-on-change**(`unit`/`target`が変化した最初の1回のみ)に変更。`FullCapacityAddNewBridgeState.Active`が外れた時点で`_lastLoggedUnit`/`_lastLoggedTarget`をリセットし、次episodeで再度ログされるようにした。
+3. **`TargetLevel[0]`の扱いを固定**: `PlaceholderTargetLevel=0`を「LOCKED(production)」として名前付き定数のままコメントを強化(cmpDrawSkillからは未読と確認済み、他の未特定consumerが万一現れた場合の修正箇所を1箇所に集約)。
+4. **診断trace整理**: `ModMain.cs`の`CurriculumGateChainTrace.Tick()/FlushPendingLogs()`呼び出しをコメントアウト(historical trace chain全体の説明コメントも簡潔化)。`Uninstall()`は旧buildの後片付け用に維持。ハードウェアブレークポイント系のtraceは削除ではなく無効化(将来の類似調査で再利用できるよう温存)。
+
+Clean build: error 0、warning 9(既存のみ)。Deploy先: `Mods\NocturneModernGameplay.dll`。SHA-256(source/deploy一致確認済み): `854752206b7910e5e9daa83c5b251cc23e043975f069da8f476f0bee3c1480a4`。
+
+### 残るproduction化タスク(User実機確認待ち)
+
+- bridge終了/キャンセル/再突入の軽い確認(state leakが無いか)
+- 別target skillでの追加確認(今回確認済みは`299:会心`1種類のみ)
+
+これらが確認でき次第、Power-Up AddNewをproduction candidateとして確定し、Mutation AddNewへ移行する。
+
+## CONFIRMED(2026-09-15、実機テストでproduction化タスク完了 — Power-Up AddNew production candidate確定)
+
+`Latest.log`(`09:35〜`)で確認:
+
+```
+HIDDENSLOT-INJECT; frame=5095; unit=60; target=16:"マハジオ"; ... (このセッションで1件のみ、log-on-change動作確認)
+
+FULLCAP-ADDNEW-CANCEL; unit=59(High Pixie); reason=target-not-present-after-forget-flow-exit
+FULLCAP-ADDNEW-COMPLETE; unit=60(Frost); finalSkills=[...,16]; sourcePreserved=True; targetPresent=True; skillcnt=8
+```
+
+1. **ログ抑制確認**: 567件→1件(log-on-change正常動作)。
+2. **別target skill確認**: `16:マハジオ`(前回`299:会心`)でも正しく名前表示・習得成功。
+3. **キャンセル/再突入確認**: unit=59での正常キャンセル後、別unit(60)・別targetでの新規episodeが state leak無く正常完了。warning/errorはセッション通算0件。
+
+**READY FOR PRODUCTION: YES。Power-Up AddNewをproduction candidateとして確定する。**
+
+### 次のフェーズ
+
+Mutation AddNewへ移行する(User方針)。Power-Up AddNew側の`HiddenSlotCandidateInjection.cs`は今後も有効なまま維持(Mutation側は別のbridge実装になる見込みのため、直接の再利用可否は別途検討)。
+
+## 追加修正(2026-09-15、同日、Mutation AddNew検証中に発見)
+
+`HiddenSlotCandidateInjection.cs`の当初ガード(`if (pInfo.SkillCnt != 0) return;`、native自身が候補を見つけていれば注入しない)は、hensinmae!=0のunit(High Pixie)でMutation/Power-Up AddNewのtargetがハイライトされないバグを引き起こすことが判明した。native自身が既に別の候補(curriculum由来、AddNew targetとは無関係)を見つけてしまうため、注入がスキップされ9枠目にはnative自身の候補が表示されていた。
+
+**修正**: ガードを撤廃し、AddNewブリッジがActiveな間は`SkillID[0]`を常にブリッジのtargetで上書きする方式に変更(`cmpDrawSkill`はindex 0のみを読むためCONFIRMED済み)。`SkillCnt`はnativeが既に1以上を書いていればそのまま尊重し、0のときのみ1へ引き上げる。同時に、`FullCapacityAddNewBridgeState.Active`単独チェックだったガード条件を、`MutationAddNewBridgeState.Active`も認識するよう拡張した(詳細は`investigations/ACQUISITION_LEARNASNEW/PLAN.md`参照)。
+
+実機確認(2026-09-15): High Pixie(unit=59)でMutation AddNew(target=32:ムド等)・Power-Up AddNew(target=39:メディア等)双方でハイライト・名前表示が正常化。既存の成功ケース(Frost、High Pixie旧経路)への回帰無し。
+
 ## 現在の優先順位
 
 - native/Unity意味論: Claude

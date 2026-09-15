@@ -4,105 +4,96 @@ using MelonLoader;
 
 namespace NocturneModernGameplay
 {
-    // HIDDEN NEW SKILL ENTRY - writer identification for [r13+0x10] (the
-    // loop-bound byte CONFIRMED this session to be 0 for Frost's failing
-    // AddNew-bridge case and 1/2 for High Pixie's succeeding case,
-    // CmpDrawSkillR13LoopBoundTrace).
+    // HIDDEN NEW SKILL ENTRY - gate1/gate2 vs gate3 split for
+    // rstcalc.rstCreateBeforeSkillList's per-candidate scan loop (VA
+    // 0x182280460-0x182280820, identified this session as the owner of
+    // [r13+0x10]/outList.count, see R13FetchAndWriteWatchTrace and
+    // investigations/HIDDEN_SKILL_ENTRY/PLAN.md).
     //
-    // Technical note this class exists to work around: `r13` is NOT a
-    // stable, long-lived object. It is fetched FRESH by
-    // cmpDrawStatusComEx2 every single time cmpDrawSkill is about to be
-    // called (`mov rcx,[0x182E46A50]; call 0x1800E6930` - VA 0x1822DB409-
-    // 0x1822DB413 - a thin trampoline into generic IL2CPP runtime
-    // dispatch/type-resolution machinery, confirmed by static disassembly
-    // this session; NOT game-specific code). Confirmed via
-    // CmpDrawSkillR13LoopBoundTrace's own log: the observed `r13` pointer
-    // value is different on almost every single hit for both units, all
-    // falling within the same overall heap address range (same kind of
-    // allocation, answering the "same kind of object?" question directly
-    // from existing log data without a fresh test). Because the object's
-    // address does not exist before that fetch call returns, a
-    // conventional STATIC hardware write-breakpoint (fixed address,
-    // installed once) cannot watch it from before construction - by the
-    // time we can read `r13` at all, any write that happened *inside* the
-    // fetch call has already occurred.
+    // Prior probe (R13WRITEWATCH-GATE3, this mod's R13FetchAndWriteWatchTrace)
+    // CONFIRMED runtime this session: unit=60(Frost) essentially never
+    // reaches the gate3 ("already owned?") check at all (1/333 combined
+    // hits, a known seq21->22 boundary noise frame), while unit=59(High
+    // Pixie) reaches it 332 times and ALWAYS passes (gate3Al=-1,
+    // appended=True every single time, for exactly two stable candidate
+    // slots: ebx=10/skillId=353 and ebx=12/skillId=72). This rules gate3
+    // OUT as Frost's blocker - Frost's candidates are failing upstream, at
+    // gate1(tag) or gate2(level threshold), before ever reaching the
+    // ownership check.
     //
-    // This class resolves that with a dynamic re-arm pattern instead of
-    // trying to guess a fixed address:
-    //   DR0 = execute breakpoint at cmpDrawStatusComEx2's fetch point (VA
-    //         0x1822DB41A, "mov [rsp+0x60],rax" - at this instant RAX
-    //         already holds the freshly-returned r13, read directly from
-    //         context, no dereference needed for the pointer itself).
-    //         On each hit: read RAX (=r13), read the CURRENT byte at
-    //         [r13+0x10] right then (the earliest observable value - if
-    //         this is already 1/2 vs 0 at this exact instant, the
-    //         divergence is baked in DURING the fetch call itself, not by
-    //         some later external writer), then dynamically reprogram DR1
-    //         to watch [r13+0x10] for WRITES from this point forward.
-    //   DR1 = dynamic 1-byte WRITE breakpoint, address reprogrammed every
-    //         time DR0 fires (a fresh r13 each frame needs a fresh watch
-    //         address; the previous frame's object is stale/possibly
-    //         reused by then, so leaving a stale DR1 armed would be
-    //         meaningless at best). Identified at fire time via DR6 status
-    //         bit 1 (its target address is not fixed, so address-matching
-    //         like DR0/DR2 below cannot be used for it). On hit: capture
-    //         the writer's return-address-adjacent RIP (from the context's
-    //         Rip field directly, since a data breakpoint traps AFTER the
-    //         faulting instruction retires - Rip already points past it)
-    //         and the byte value AFTER the write, for later ASLR-correction
-    //         to a static VA and manual disassembly of the writer site.
-    //   DR2 = execute breakpoint at cmpDrawSkill's own loop-bound read (VA
-    //         0x1822DA05E, "test r13,r13" - the same point
-    //         CmpDrawSkillR13LoopBoundTrace used), kept here too so a
-    //         single test run yields BOTH the fetch-time value and the
-    //         final value seen by the loop in one pass, without requiring
-    //         two separate sessions.
+    // This class narrows that further with a SECOND fixed execute point
+    // placed right after gate1(tag) has already passed (if tag failed, this
+    // address is never reached for that ebx - control jumps straight to the
+    // loop increment instead):
+    //   GateCheckVa (existing)   = 0x1822805CC "test al,al"      (gate3 outcome)
+    //   Gate1PassVa (new)        = 0x1822805B4 "cmp ebp,ecx"     (gate1 passed,
+    //                              about to evaluate gate2; entry pointer is
+    //                              in RDX at this instant, so the entry's raw
+    //                              tag/level/skillId fields are read directly
+    //                              from memory rather than trusted to survive
+    //                              in a register)
+    //   LoopReadVa (kept)        = 0x1822DA05E "test r13,r13"    (final
+    //                              loopBound, same as CmpDrawSkillR13LoopBoundTrace/
+    //                              R13FetchAndWriteWatchTrace, kept here purely
+    //                              for cross-checking in the same run)
+    //
+    // Classification per ebx (0..23), derivable offline from these two
+    // event streams plus the fixed 24-iteration loop bound:
+    //   - ebx never appears in EITHER stream -> gate1(tag) failed.
+    //   - ebx appears in Gate1Pass but never in GateCheck -> gate1 passed,
+    //     gate2(level) failed.
+    //   - ebx appears in both -> gate1+gate2 passed, gate3 outcome is
+    //     GateCheck's appended field (already known to be True whenever it
+    //     fires, per the prior probe's finding above).
+    //
+    // No dynamic DR reprogramming needed this time (all three points are
+    // fixed addresses known ahead of time) - simpler VEH than
+    // R13FetchAndWriteWatchTrace's DR0/DR1 fetch+write-watch pair, which
+    // this class does not reuse (that question - "who resets/increments the
+    // counter" - is already answered).
     //
     // Read-only from the game's perspective: no GameAssembly.dll bytes are
     // written, only CPU debug registers (Dr0-Dr3/Dr7) on this thread's
-    // CONTEXT, exactly like every other hardware-breakpoint probe already
-    // in this mod.
-    internal static class R13FetchAndWriteWatchTrace
+    // CONTEXT, exactly like every other hardware-breakpoint probe already in
+    // this mod.
+    internal static class CurriculumGateChainTrace
     {
         internal static readonly bool Enabled = true;
 
         private const long GameAssemblyPreferredBase = 0x180000000L;
 
-        private const long FetchVa = 0x1822DB41AL; // cmpDrawStatusComEx2: "mov [rsp+0x60],rax"
-        private static readonly byte[] FetchBytes = { 0x48, 0x89, 0x44, 0x24, 0x60 };
-
         private const long LoopReadVa = 0x1822DA05EL; // cmpDrawSkill: "test r13,r13"
         private static readonly byte[] LoopReadBytes = { 0x4D, 0x85, 0xED };
 
-        // rstcalc.rstCreateBeforeSkillList (VA 0x182280460 - identified this
-        // session as the owner of both writer1=0x1822804BD(reset to 0) and
-        // writer2=0x1822805FF(increment), matching the [r13+0x10]/[rsi+0x10]
-        // counter this trace already watches - "rsi" there IS the outList
-        // object later read back as "r13" in cmpDrawSkill). Per-candidate
-        // gate chain confirmed by static disassembly (ebx=0..23 loop over a
-        // curriculum array at [rdi+0x18]):
-        //   gate1 (tag):   byte[entry+0x11] == 6 or 1 (branch depends on
-        //                  word[r15+0x88])
-        //   gate2 (level): sbyte[entry+0x10] > word[r15+0x24]+param3
-        //   gate3 (owned): call 0x182410660(pStock, skillId, 0) must return
-        //                  NEGATIVE (AL high bit set) to append
-        // Reaching GateCheckVa means gate1+gate2 already passed; AL there is
-        // gate3's raw result. This is the exact point CONFIRMED (runtime,
-        // this session) to gate writer2: unit=59(High Pixie) appends here on
-        // ~91% of loop iterations that reach it (loopBound ends at 1 or 2),
-        // unit=60(Frost) essentially never does (loopBound stays 0, one
-        // 1/206 exception at a seq21->22 boundary frame, presumed stale-read
-        // noise). This probe exists to show WHICH gate(s) Frost's curriculum
-        // entries fail: never reaching GateCheckVa at all (gate1/gate2 fail
-        // for every ebx) vs reaching it but always getting AL>=0 (gate3/
-        // "already owned" fails for every ebx).
+        private const long Gate1PassVa = 0x1822805B4L; // rstCreateBeforeSkillList: "cmp ebp,ecx" (post gate1/tag)
+        private static readonly byte[] Gate1PassBytes = { 0x3B, 0xE9 };
+
         private const long GateCheckVa = 0x1822805CCL; // rstCreateBeforeSkillList: "test al,al" (post gate3 call)
         private static readonly byte[] GateCheckBytes = { 0x84, 0xC0 };
+
+        // User hypothesis (2026-09-15, cross-checked against this project's
+        // own cpp2il dump, .analysis/cpp2il_cs/DiffableCs/Assembly-CSharp/
+        // newdata_H/datUnitWork_s.cs): if r15 in rstCreateBeforeSkillList
+        // really is pStock/datUnitWork_s*, then [r15+0x88] is not an
+        // arbitrary flag - it is the named field `hensinmae` (ushort,
+        // "pre-transformation [species]"), and [r15+0x24]/[r15+0x14] (both
+        // already read by this function, confirmed by static disassembly
+        // this session) line up exactly with datUnitWork_s.level(0x24,
+        // ushort)/id(0x14, ushort). This probe captures all three PLUS
+        // skillcnt(0x48, int) - a field already independently CONFIRMED in
+        // this project (01_CURRENT_STATE.md, PowerUp candidate-scan
+        // investigation) to belong to pStock - in one shot, at the earliest
+        // point in the function where r15 is valid (right after `mov
+        // r15,rdx`), so a mismatch with the known-good skillcnt reading
+        // would immediately disprove "r15==pStock" rather than requiring a
+        // separate check.
+        private const long StockFieldProbeVa = 0x182280480L; // rstCreateBeforeSkillList: "movsx r14,cl" (right after r15 is set)
+        private static readonly byte[] StockFieldProbeBytes = { 0x4C, 0x0F, 0xBE, 0xF1 };
 
         private const int MaxArmedFrames = 36000; // ~10 minutes at 60fps
         private static int _armedAtFrame = -1;
 
-        private enum HitKind { Fetch = 0, Write = 1, LoopRead = 2, GateCheck = 3 }
+        private enum HitKind { LoopRead = 0, Gate1Pass = 1, GateCheck = 2, StockFields = 3 }
 
         private struct PendingHit
         {
@@ -112,18 +103,29 @@ namespace NocturneModernGameplay
             internal int Unit;
             internal int Target;
             internal HitKind Kind;
-            internal long R13OrAddr; // Fetch/LoopRead: r13 pointer. Write: the watched address (r13+0x10).
-            internal int ByteValue;  // the byte at +0x10, at the moment of this hit
-            internal long WriterRip; // Write hits only: RIP right after the faulting instruction
-            internal int Ebx;        // GateCheck only: candidate slot index (0..23) within rstCreateBeforeSkillList's loop
-            internal int SkillId;    // GateCheck only: candidate skill ID (r14w at the gate3 call site)
-            internal int Gate3Al;    // GateCheck only: raw AL (sign-extended to int) from the ownership-check call
+            internal int Ebx;
+            internal int SkillId;
+            internal int Tag;         // Gate1Pass only: byte[entry+0x11]
+            internal int LevelThresh; // Gate1Pass only: sbyte[entry+0x10]
+            internal int LevelBase;   // Gate1Pass only: ecx at that instant ([r15+0x24]+levelParam)
+            internal int Gate3Al;     // GateCheck only
+            internal long R13;        // LoopRead only
+            internal int LoopBound;   // LoopRead only
+            internal long ByteArrayPtr;  // LoopRead only: [r13+0x18] (outList's byte[] - levelThresh/type per candidate; CONFIRMED this session to be read NOWHERE in cmpDrawSkill's full body)
+            internal int ByteArrayLen;   // LoopRead only: IL2CPP array Length header, [ByteArrayPtr+0x18]
+            internal long WordArrayPtr;  // LoopRead only: [r13+0x20] (outList's skillId array - the only outList sub-array cmpDrawSkill actually reads)
+            internal int WordArrayLen;   // LoopRead only: IL2CPP array Length header, [WordArrayPtr+0x18]
+            internal long R15;        // StockFields only: the raw pStock pointer itself
+            internal int StockId;     // StockFields only: [r15+0x14] (candidate: datUnitWork_s.id)
+            internal int StockLevel;  // StockFields only: [r15+0x24] (candidate: datUnitWork_s.level)
+            internal int StockSkillCnt; // StockFields only: [r15+0x48] (candidate: datUnitWork_s.skillcnt, independently CONFIRMED elsewhere in this project)
+            internal int StockHensinmae; // StockFields only: [r15+0x88] (candidate: datUnitWork_s.hensinmae)
         }
 
         private const int MaxHits = 96;
         private static readonly PendingHit[] _pending = new PendingHit[MaxHits];
         private static int _pendingCount;
-        private static long _totalFetchHits, _totalWriteHits, _totalLoopReadHits, _totalGateCheckHits;
+        private static long _totalLoopReadHits, _totalGate1PassHits, _totalGateCheckHits, _totalStockFieldsHits;
 
         private static int _cachedFrame;
         private static int _cachedSeq = -1;
@@ -143,26 +145,29 @@ namespace NocturneModernGameplay
         private const int OffsetDr6 = 0x68;
         private const int OffsetDr7 = 0x70;
         private const int OffsetRax = 0x78;
+        private const int OffsetRcx = 0x80;
+        private const int OffsetRdx = 0x88;
         private const int OffsetRbx = 0x90;
+        private const int OffsetR13 = 0xE0;
         private const int OffsetR14 = 0xE8;
+        private const int OffsetR15 = 0xF0;
         private const int OffsetRip = 0xF8;
         private const int ResumeFlagBit = 0x10000;
 
-        // L0,L1,L2,L3 enabled (bits 0,2,4,6). RW/LEN nibbles: DR0=execute
-        // (00,00), DR1=write-1-byte(01,00), DR2=execute(00,00), DR3=execute
-        // (00,00).
+        // L0,L1,L2,L3 enabled (bits 0,2,4,6), all execute-shaped (RW/LEN
+        // nibbles stay 0 for all four).
         private const long Dr7LocalEnableMask = 0x1L | 0x4L | 0x10L | 0x40L;
-        private const long Dr7Rw1WriteLen1Byte = 0x1L << 20; // RW1=01 at bits 20-21, LEN1=00 at bits 22-23
-        private const long Dr7RwLenAllUsedMask = 0xFFFFL << 16; // clears RW/LEN nibbles for DR0,DR1,DR2,DR3 (bits 16-31) before setting
+        private const long Dr7RwLenAllUsedMask = 0xFFFFL << 16; // clears RW/LEN nibbles for DR0,DR1,DR2,DR3 (bits 16-31)
 
         private const uint ExceptionSingleStep = 0x80000004;
         private const int ExceptionContinueExecution = -1;
         private const int ExceptionContinueSearch = 0;
 
         private static long _actualModuleBase;
-        private static IntPtr _addrFetch = IntPtr.Zero;
         private static IntPtr _addrLoopRead = IntPtr.Zero;
+        private static IntPtr _addrGate1Pass = IntPtr.Zero;
         private static IntPtr _addrGateCheck = IntPtr.Zero;
+        private static IntPtr _addrStockFieldProbe = IntPtr.Zero;
         private static IntPtr _vehHandle = IntPtr.Zero;
         private static VectoredHandlerDelegate? _handlerDelegate;
         private static bool _installed;
@@ -212,16 +217,16 @@ namespace NocturneModernGameplay
                 if (elapsed >= MaxArmedFrames)
                 {
                     MelonLogger.Msg(
-                        "[NocturneModernGameplay] R13WRITEWATCH-AUTOUNINSTALL; " +
-                        $"fetchHits={_totalFetchHits}; writeHits={_totalWriteHits}; loopReadHits={_totalLoopReadHits}; " +
-                        $"gateCheckHits={_totalGateCheckHits}; armedFrames={elapsed}.");
+                        "[NocturneModernGameplay] CURRICULUMGATE-AUTOUNINSTALL; " +
+                        $"loopReadHits={_totalLoopReadHits}; gate1PassHits={_totalGate1PassHits}; " +
+                        $"gateCheckHits={_totalGateCheckHits}; stockFieldsHits={_totalStockFieldsHits}; armedFrames={elapsed}.");
                     Uninstall();
                 }
             }
             catch (Exception ex)
             {
                 MelonLogger.Warning(
-                    $"[NocturneModernGameplay] R13FetchAndWriteWatchTrace.Tick failed safely: {ex.Message}");
+                    $"[NocturneModernGameplay] CurriculumGateChainTrace.Tick failed safely: {ex.Message}");
             }
         }
 
@@ -237,9 +242,10 @@ namespace NocturneModernGameplay
                         $"GameAssembly.dll module base unavailable; error={Marshal.GetLastWin32Error()}");
                 _actualModuleBase = moduleBase.ToInt64();
 
-                _addrFetch = ResolveAndVerify(moduleBase, FetchVa, FetchBytes, "fetch-point");
                 _addrLoopRead = ResolveAndVerify(moduleBase, LoopReadVa, LoopReadBytes, "loop-read-point");
+                _addrGate1Pass = ResolveAndVerify(moduleBase, Gate1PassVa, Gate1PassBytes, "gate1-pass-point");
                 _addrGateCheck = ResolveAndVerify(moduleBase, GateCheckVa, GateCheckBytes, "gate3-check-point");
+                _addrStockFieldProbe = ResolveAndVerify(moduleBase, StockFieldProbeVa, StockFieldProbeBytes, "stock-field-probe-point");
 
                 _handlerDelegate = VectoredHandler;
                 _vehHandle = AddVectoredExceptionHandler(1, _handlerDelegate);
@@ -250,16 +256,15 @@ namespace NocturneModernGameplay
 
                 _installed = true;
                 MelonLogger.Msg(
-                    "[NocturneModernGameplay] R13WRITEWATCH-INSTALLED; " +
-                    $"fetch=0x{_addrFetch.ToInt64():X}; loopRead=0x{_addrLoopRead.ToInt64():X}; " +
-                    $"gateCheck=0x{_addrGateCheck.ToInt64():X}; " +
-                    "dr1=dynamic(reprogrammed each fetch hit); " +
-                    "mechanism=hardware-execute-x3+write-x1(no GameAssembly.dll bytes written).");
+                    "[NocturneModernGameplay] CURRICULUMGATE-INSTALLED; " +
+                    $"loopRead=0x{_addrLoopRead.ToInt64():X}; gate1Pass=0x{_addrGate1Pass.ToInt64():X}; " +
+                    $"gateCheck=0x{_addrGateCheck.ToInt64():X}; stockFieldProbe=0x{_addrStockFieldProbe.ToInt64():X}; " +
+                    "mechanism=hardware-execute-x4(no GameAssembly.dll bytes written).");
             }
             catch (Exception ex)
             {
                 MelonLogger.Error(
-                    $"[NocturneModernGameplay] R13FetchAndWriteWatchTrace install refused safely: {ex}");
+                    $"[NocturneModernGameplay] CurriculumGateChainTrace install refused safely: {ex}");
                 Uninstall();
             }
         }
@@ -279,13 +284,13 @@ namespace NocturneModernGameplay
         {
             try
             {
-                if (_addrFetch != IntPtr.Zero || _addrLoopRead != IntPtr.Zero || _addrGateCheck != IntPtr.Zero)
+                if (_addrLoopRead != IntPtr.Zero || _addrGate1Pass != IntPtr.Zero || _addrGateCheck != IntPtr.Zero || _addrStockFieldProbe != IntPtr.Zero)
                 {
                     try { RemoveHardwareBreakpointsOnCurrentThread(); }
                     catch (Exception ex)
                     {
                         MelonLogger.Warning(
-                            $"[NocturneModernGameplay] R13FetchAndWriteWatchTrace breakpoint removal failed: {ex.Message}");
+                            $"[NocturneModernGameplay] CurriculumGateChainTrace breakpoint removal failed: {ex.Message}");
                     }
                 }
                 if (_vehHandle != IntPtr.Zero)
@@ -299,9 +304,10 @@ namespace NocturneModernGameplay
                 _installed = false;
                 _uninstalled = true;
                 _handlerDelegate = null;
-                _addrFetch = IntPtr.Zero;
                 _addrLoopRead = IntPtr.Zero;
+                _addrGate1Pass = IntPtr.Zero;
                 _addrGateCheck = IntPtr.Zero;
+                _addrStockFieldProbe = IntPtr.Zero;
             }
         }
 
@@ -316,18 +322,14 @@ namespace NocturneModernGameplay
                     throw new InvalidOperationException(
                         $"GetThreadContext failed; error={Marshal.GetLastWin32Error()}");
 
-                Marshal.WriteInt64(ctx, OffsetDr0, _addrFetch.ToInt64());
-                Marshal.WriteInt64(ctx, OffsetDr1, 0); // no valid r13 yet - DR1 left disabled until first fetch hit
-                Marshal.WriteInt64(ctx, OffsetDr2, _addrLoopRead.ToInt64());
-                Marshal.WriteInt64(ctx, OffsetDr3, _addrGateCheck.ToInt64());
+                Marshal.WriteInt64(ctx, OffsetDr0, _addrLoopRead.ToInt64());
+                Marshal.WriteInt64(ctx, OffsetDr1, _addrGate1Pass.ToInt64());
+                Marshal.WriteInt64(ctx, OffsetDr2, _addrGateCheck.ToInt64());
+                Marshal.WriteInt64(ctx, OffsetDr3, _addrStockFieldProbe.ToInt64());
 
                 long dr7 = Marshal.ReadInt64(ctx, OffsetDr7);
-                dr7 &= ~Dr7RwLenAllUsedMask;                 // DR0/DR1/DR2/DR3 RW/LEN nibbles -> 0 (execute-shaped)
-                dr7 |= Dr7Rw1WriteLen1Byte;                   // then set DR1's nibble to write/1-byte
-                // Only L0, L2, L3 enabled at install time - L1 (the dynamic
-                // write watch) is turned on inside the VEH once a real r13
-                // address is known, never before.
-                dr7 = (dr7 & ~(0x1L | 0x4L | 0x10L | 0x40L)) | (0x1L | 0x10L | 0x40L);
+                dr7 &= ~Dr7RwLenAllUsedMask;                  // DR0/DR1/DR2 RW/LEN nibbles -> 0 (execute-shaped)
+                dr7 = (dr7 & ~(0x1L | 0x4L | 0x10L)) | Dr7LocalEnableMask;
                 Marshal.WriteInt64(ctx, OffsetDr7, dr7);
 
                 Marshal.WriteInt32(ctx, OffsetContextFlags, unchecked((int)ContextDebugRegisters));
@@ -341,7 +343,7 @@ namespace NocturneModernGameplay
                         $"post-install GetThreadContext readback failed; error={Marshal.GetLastWin32Error()}");
 
                 long dr7Rb = Marshal.ReadInt64(ctx, OffsetDr7);
-                if ((dr7Rb & (0x1L | 0x10L | 0x40L)) != (0x1L | 0x10L | 0x40L))
+                if ((dr7Rb & Dr7LocalEnableMask) != Dr7LocalEnableMask)
                     throw new InvalidOperationException(
                         $"hardware breakpoint readback mismatch; dr7=0x{dr7Rb:X}");
             }
@@ -380,11 +382,10 @@ namespace NocturneModernGameplay
             return ctx;
         }
 
-        // Runs inside #DB exception dispatch. Address compares for the two
-        // fixed execute points; DR6 status-bit check for the dynamic write
-        // point (its address is not fixed, so it cannot be matched by
-        // comparing exceptionAddress). A couple of plain register/memory
-        // reads - no IL2CPP access, no allocation.
+        // Runs inside #DB exception dispatch. All three points are fixed
+        // addresses (no dynamic reprogramming this time), so a plain
+        // exceptionAddress compare identifies each one. A couple of plain
+        // register/memory reads - no IL2CPP access, no allocation.
         private static int VectoredHandler(IntPtr exceptionPointers)
         {
             try
@@ -396,53 +397,27 @@ namespace NocturneModernGameplay
                 if (exceptionCode != ExceptionSingleStep) return ExceptionContinueSearch;
 
                 IntPtr exceptionAddress = Marshal.ReadIntPtr(exceptionRecordPtr, 0x10);
-                long dr6 = Marshal.ReadInt64(contextRecordPtr, OffsetDr6);
-                bool bp1Fired = (dr6 & 0x2L) != 0;
 
-                if (exceptionAddress == _addrFetch)
-                {
-                    _totalFetchHits++;
-                    long rax = Marshal.ReadInt64(contextRecordPtr, OffsetRax); // = fresh r13
-                    long watchAddr = rax != 0 ? rax + 0x10 : 0;
-                    int byteNow = -1;
-                    if (rax != 0)
-                    {
-                        try { byteNow = Marshal.ReadByte(new IntPtr(watchAddr)); } catch { byteNow = -1; }
-                    }
-
-                    if (_pendingCount < MaxHits)
-                    {
-                        ref PendingHit slot = ref _pending[_pendingCount];
-                        slot.Frame = _cachedFrame;
-                        slot.Seq = _cachedSeq;
-                        slot.BridgeActive = _cachedBridgeActive;
-                        slot.Unit = _cachedUnit;
-                        slot.Target = _cachedTarget;
-                        slot.Kind = HitKind.Fetch;
-                        slot.R13OrAddr = rax;
-                        slot.ByteValue = byteNow;
-                        slot.WriterRip = 0;
-                        _pendingCount++;
-                    }
-
-                    // Reprogram DR1 to watch this frame's [r13+0x10], and
-                    // make sure L1 is enabled (harmless if already set).
-                    if (rax != 0)
-                    {
-                        Marshal.WriteInt64(contextRecordPtr, OffsetDr1, watchAddr);
-                        long dr7 = Marshal.ReadInt64(contextRecordPtr, OffsetDr7);
-                        dr7 |= 0x4L; // L1
-                        Marshal.WriteInt64(contextRecordPtr, OffsetDr7, dr7);
-                    }
-                }
-                else if (exceptionAddress == _addrLoopRead)
+                if (exceptionAddress == _addrLoopRead)
                 {
                     _totalLoopReadHits++;
-                    long r13 = Marshal.ReadInt64(contextRecordPtr, 0xE0); // R13 offset, same as CmpDrawSkillR13LoopBoundTrace
+                    long r13 = Marshal.ReadInt64(contextRecordPtr, OffsetR13);
                     int byteNow = -1;
+                    long byteArrayPtr = 0, wordArrayPtr = 0;
+                    int byteArrayLen = -1, wordArrayLen = -1;
                     if (r13 != 0)
                     {
                         try { byteNow = Marshal.ReadByte(new IntPtr(r13 + 0x10)); } catch { byteNow = -1; }
+                        try { byteArrayPtr = Marshal.ReadInt64(new IntPtr(r13 + 0x18)); } catch { }
+                        try { wordArrayPtr = Marshal.ReadInt64(new IntPtr(r13 + 0x20)); } catch { }
+                        if (byteArrayPtr != 0)
+                        {
+                            try { byteArrayLen = Marshal.ReadInt32(new IntPtr(byteArrayPtr + 0x18)); } catch { }
+                        }
+                        if (wordArrayPtr != 0)
+                        {
+                            try { wordArrayLen = Marshal.ReadInt32(new IntPtr(wordArrayPtr + 0x18)); } catch { }
+                        }
                     }
                     if (_pendingCount < MaxHits)
                     {
@@ -453,9 +428,44 @@ namespace NocturneModernGameplay
                         slot.Unit = _cachedUnit;
                         slot.Target = _cachedTarget;
                         slot.Kind = HitKind.LoopRead;
-                        slot.R13OrAddr = r13;
-                        slot.ByteValue = byteNow;
-                        slot.WriterRip = 0;
+                        slot.R13 = r13;
+                        slot.LoopBound = byteNow;
+                        slot.ByteArrayPtr = byteArrayPtr;
+                        slot.ByteArrayLen = byteArrayLen;
+                        slot.WordArrayPtr = wordArrayPtr;
+                        slot.WordArrayLen = wordArrayLen;
+                        _pendingCount++;
+                    }
+                }
+                else if (exceptionAddress == _addrGate1Pass)
+                {
+                    _totalGate1PassHits++;
+                    long rbx = Marshal.ReadInt64(contextRecordPtr, OffsetRbx);
+                    long rdx = Marshal.ReadInt64(contextRecordPtr, OffsetRdx); // curriculum entry pointer
+                    long rcx = Marshal.ReadInt64(contextRecordPtr, OffsetRcx); // level baseline ([r15+0x24]+levelParam)
+
+                    int tag = -1, levelThresh = -999, skillId = -1;
+                    if (rdx != 0)
+                    {
+                        try { tag = Marshal.ReadByte(new IntPtr(rdx + 0x11)); } catch { }
+                        try { levelThresh = unchecked((sbyte)Marshal.ReadByte(new IntPtr(rdx + 0x10))); } catch { }
+                        try { skillId = Marshal.ReadInt16(new IntPtr(rdx + 0x12)); } catch { }
+                    }
+
+                    if (_pendingCount < MaxHits)
+                    {
+                        ref PendingHit slot = ref _pending[_pendingCount];
+                        slot.Frame = _cachedFrame;
+                        slot.Seq = _cachedSeq;
+                        slot.BridgeActive = _cachedBridgeActive;
+                        slot.Unit = _cachedUnit;
+                        slot.Target = _cachedTarget;
+                        slot.Kind = HitKind.Gate1Pass;
+                        slot.Ebx = unchecked((int)(rbx & 0xFFFFFFFF));
+                        slot.SkillId = skillId;
+                        slot.Tag = tag;
+                        slot.LevelThresh = levelThresh;
+                        slot.LevelBase = unchecked((int)(rcx & 0xFFFFFFFF));
                         _pendingCount++;
                     }
                 }
@@ -476,22 +486,24 @@ namespace NocturneModernGameplay
                         slot.Unit = _cachedUnit;
                         slot.Target = _cachedTarget;
                         slot.Kind = HitKind.GateCheck;
-                        slot.R13OrAddr = 0;
-                        slot.ByteValue = 0;
-                        slot.WriterRip = 0;
                         slot.Ebx = unchecked((int)(rbx & 0xFFFFFFFF));
                         slot.SkillId = unchecked((int)(r14 & 0xFFFF));
                         slot.Gate3Al = al;
                         _pendingCount++;
                     }
                 }
-                else if (bp1Fired)
+                else if (exceptionAddress == _addrStockFieldProbe)
                 {
-                    _totalWriteHits++;
-                    long watchAddr = Marshal.ReadInt64(contextRecordPtr, OffsetDr1);
-                    long rip = Marshal.ReadInt64(contextRecordPtr, OffsetRip);
-                    int byteNow = -1;
-                    try { byteNow = Marshal.ReadByte(new IntPtr(watchAddr)); } catch { byteNow = -1; }
+                    _totalStockFieldsHits++;
+                    long r15 = Marshal.ReadInt64(contextRecordPtr, OffsetR15);
+                    int stockId = -1, stockLevel = -1, stockSkillCnt = -1, stockHensinmae = -1;
+                    if (r15 != 0)
+                    {
+                        try { stockId = Marshal.ReadInt16(new IntPtr(r15 + 0x14)); } catch { }
+                        try { stockLevel = Marshal.ReadInt16(new IntPtr(r15 + 0x24)); } catch { }
+                        try { stockSkillCnt = Marshal.ReadInt32(new IntPtr(r15 + 0x48)); } catch { }
+                        try { stockHensinmae = Marshal.ReadInt16(new IntPtr(r15 + 0x88)); } catch { }
+                    }
 
                     if (_pendingCount < MaxHits)
                     {
@@ -501,10 +513,12 @@ namespace NocturneModernGameplay
                         slot.BridgeActive = _cachedBridgeActive;
                         slot.Unit = _cachedUnit;
                         slot.Target = _cachedTarget;
-                        slot.Kind = HitKind.Write;
-                        slot.R13OrAddr = watchAddr;
-                        slot.ByteValue = byteNow;
-                        slot.WriterRip = rip;
+                        slot.Kind = HitKind.StockFields;
+                        slot.R15 = r15;
+                        slot.StockId = stockId & 0xFFFF;
+                        slot.StockLevel = stockLevel & 0xFFFF;
+                        slot.StockSkillCnt = stockSkillCnt;
+                        slot.StockHensinmae = stockHensinmae & 0xFFFF;
                         _pendingCount++;
                     }
                 }
@@ -529,10 +543,7 @@ namespace NocturneModernGameplay
         }
 
         // Ordinary managed context only - called from ModMain.OnUpdate,
-        // never from the VEH. Writer RIPs are logged raw (runtime/ASLR
-        // address) - correct them to a static VA offline the same way
-        // every other probe in this mod already does
-        // (runtimeAddr - actualModuleBase + 0x180000000).
+        // never from the VEH.
         internal static void FlushPendingLogs()
         {
             int count = _pendingCount;
@@ -542,31 +553,34 @@ namespace NocturneModernGameplay
                 ref PendingHit hit = ref _pending[i];
                 switch (hit.Kind)
                 {
-                    case HitKind.Fetch:
-                        MelonLogger.Msg(
-                            "[NocturneModernGameplay] R13WRITEWATCH-FETCH; " +
-                            $"frame={hit.Frame}; seq={hit.Seq}; bridgeActive={hit.BridgeActive}; unit={hit.Unit}; " +
-                            $"target={hit.Target}; r13=0x{hit.R13OrAddr:X}; byteAtFetch={hit.ByteValue}.");
-                        break;
-                    case HitKind.Write:
-                        MelonLogger.Msg(
-                            "[NocturneModernGameplay] R13WRITEWATCH-WRITE; " +
-                            $"frame={hit.Frame}; seq={hit.Seq}; bridgeActive={hit.BridgeActive}; unit={hit.Unit}; " +
-                            $"target={hit.Target}; addr=0x{hit.R13OrAddr:X}; byteAfterWrite={hit.ByteValue}; " +
-                            $"writerRipRuntime=0x{hit.WriterRip:X}.");
-                        break;
                     case HitKind.LoopRead:
                         MelonLogger.Msg(
-                            "[NocturneModernGameplay] R13WRITEWATCH-LOOPREAD; " +
+                            "[NocturneModernGameplay] CURRICULUMGATE-LOOPREAD; " +
                             $"frame={hit.Frame}; seq={hit.Seq}; bridgeActive={hit.BridgeActive}; unit={hit.Unit}; " +
-                            $"target={hit.Target}; r13=0x{hit.R13OrAddr:X}; loopBound={hit.ByteValue}.");
+                            $"target={hit.Target}; r13=0x{hit.R13:X}; loopBound={hit.LoopBound}; " +
+                            $"byteArrayPtr=0x{hit.ByteArrayPtr:X}; byteArrayLen={hit.ByteArrayLen}; " +
+                            $"wordArrayPtr=0x{hit.WordArrayPtr:X}; wordArrayLen={hit.WordArrayLen}.");
+                        break;
+                    case HitKind.Gate1Pass:
+                        MelonLogger.Msg(
+                            "[NocturneModernGameplay] CURRICULUMGATE-GATE1PASS; " +
+                            $"frame={hit.Frame}; seq={hit.Seq}; bridgeActive={hit.BridgeActive}; unit={hit.Unit}; " +
+                            $"target={hit.Target}; ebx={hit.Ebx}; skillId={hit.SkillId}; tag={hit.Tag}; " +
+                            $"levelThresh={hit.LevelThresh}; levelBase={hit.LevelBase}.");
                         break;
                     case HitKind.GateCheck:
                         MelonLogger.Msg(
-                            "[NocturneModernGameplay] R13WRITEWATCH-GATE3; " +
+                            "[NocturneModernGameplay] CURRICULUMGATE-GATE3; " +
                             $"frame={hit.Frame}; seq={hit.Seq}; bridgeActive={hit.BridgeActive}; unit={hit.Unit}; " +
                             $"target={hit.Target}; ebx={hit.Ebx}; skillId={hit.SkillId}; gate3Al={hit.Gate3Al}; " +
                             $"appended={(hit.Gate3Al < 0)}.");
+                        break;
+                    case HitKind.StockFields:
+                        MelonLogger.Msg(
+                            "[NocturneModernGameplay] CURRICULUMGATE-STOCKFIELDS; " +
+                            $"frame={hit.Frame}; seq={hit.Seq}; bridgeActive={hit.BridgeActive}; unit={hit.Unit}; " +
+                            $"target={hit.Target}; r15=0x{hit.R15:X}; stockId={hit.StockId}; stockLevel={hit.StockLevel}; " +
+                            $"stockSkillCnt={hit.StockSkillCnt}; stockHensinmae={hit.StockHensinmae}.");
                         break;
                 }
             }

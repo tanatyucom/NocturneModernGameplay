@@ -117,6 +117,13 @@ namespace NocturneModernGameplay
 
                 if (FullCapacityAddNewBridgeState.Active) return;
 
+                // Mutual exclusion with Mutation AddNew (2026-09-15,
+                // User-directed minimal additive guard - see
+                // MutationFullCapacityAddNewBridgePoc.cs's own comment for
+                // the full reasoning). Does not alter this trigger's own
+                // decision logic otherwise.
+                if (MutationAddNewBridgeState.Active) return;
+
                 ushort target = gbwk.PUpSkillID;
                 if (target == 0) return;
 

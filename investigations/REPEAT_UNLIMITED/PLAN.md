@@ -496,6 +496,16 @@ HarmonyでこのメソッドをPostfixすると、Harmonyの引数バインデ�
 6. **次の推奨(2026-09-12時点)**: 同一設定(`SkillMutation.Chance=Native` / `SkillPowerUp.Chance=Always` / `SkillPowerUp.Repeat=Unlimited`)のまま追加レベルアップを行い、R0-C conversionとR0-B protectionの再現性(observed case数)を積み増す。`SkillMutation.Chance=Disabled`との組み合わせは、設定間相互作用レビュー(2026-09-12)で技術的にUNRESOLVEDと判定済みの既知制限であり、今回は触れず維持する。
 7. production sign-off(READY FOR PRODUCTION)には、上記6の追加runtime coverageに加え、`Mutation.Disabled`との共存問題の解決(Harmony実行順序の実機検証、または単一Postfixへの統合設計)が必要。
 
+## 別レイヤーの関連regression(2026-09-15、発見・修正済み、本investigation対象外だが記録)
+
+Mutation AddNew実装のruntime検証中に、`SkillPowerUp.Chance=Always`側(`src/SkillMutationV3/SkillPowerUpChanceControl.cs`、Phase A実装)に、本investigation(Repeat=Unlimited、Phase C)追加後に取り残されていた条件分岐があることが判明した。`SkillPowerUpChanceAlwaysPatch.Postfix`の`if (_bit6WasSet) return;`がコード自身のコメント「Repeat=Native only path in Phase A」通りに`GameplaySettingsService.Repeat`をチェックしておらず、Repeat=Unlimitedでもbit6 SET後は2/3→1変換を無条件skipしていた。`if (_bit6WasSet && GameplaySettingsService.Repeat != "Unlimited") return;`へ修正し、実機確認済み(`unit=59`で3/3イベント全て`pUpResultAfter=1`)。詳細は`01_CURRENT_STATE.md`Phase E、`investigations/ACQUISITION_LEARNASNEW/PLAN.md`参照。**本investigation(`OptionFRepeatUnlimitedControl.cs`、rawResult==0専用)のコード自体は変更していない。**
+
+## 残課題(2026-09-15、UNRESOLVED、次回最優先)
+
+上記Phase E修正とは独立に、`OPTION-F-DECISION`ログの`exclusionObserved`が実機セッション全体を通じて常に`False`になっており、`bit6WasSet=True`のケースが一貫して`action=ABORTED_INCONSISTENT_OBSERVER`となる事象を`unit=59`/`unit=60`両方で観測した(2026-09-12時点では`exclusionObserved=True`が複数回観測されていたことと矛盾する、regressionの可能性)。
+
+一時診断ログ(`OPTIONF-DIAG-EXCLUSION-HIT`/`OPTIONF-DIAG-TOTAL-CALLS`、`OptionFRepeatUnlimitedControl.cs`に追加済み、`Enabled`フラグ無し・常時稼働)を仕込んだが、まだ実機データを収集していない。**次回再開時、この診断ログを使って`rstCreateBeforeSkillList`が`rstCalcSkillPowerUpCore`のCore-active window内で実際に呼ばれているかを直接確認するところから始める。**
+
 ## 禁止事項(継続)
 
 - 旧Queue/Inline/RepeatableSkillPowerUp.csの単純復活。

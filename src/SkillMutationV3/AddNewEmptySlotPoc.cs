@@ -236,6 +236,13 @@ namespace NocturneModernGameplay
                     return;
                 }
 
+                // Mutual exclusion with Mutation AddNew (2026-09-15,
+                // User-directed minimal additive guard - see
+                // MutationFullCapacityAddNewBridgePoc.cs's own comment for
+                // the full reasoning). Does not alter this PoC's own
+                // decision logic otherwise.
+                if (MutationAddNewBridgeState.Active) return;
+
                 sbyte originalIndex = gbwk.PUpSkillIndex;
                 if (originalIndex < 0) return;
 

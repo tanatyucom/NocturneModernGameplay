@@ -510,6 +510,32 @@ Power-UpとMutationは別々に候補計算して比較する設計ではない�
   - seq `21` → `rstUpdateSeqDestroySkill`(VA `0x1822890D0`)
   - seq `22` → `rstUpdateSeqDestroyConfirm`(VA `0x182288B20`)
 
+### 再開: Mutation AddNew native lifecycle(2026-09-15、`investigations/ACQUISITION_LEARNASNEW/PLAN.md`)
+
+本investigationはHidden New Skill Entry解決後、User方針により新規investigationを立てずV3 zero-base調査として再開した(旧Queue/Inline/Learn-As-New実装はhistorical evidenceとしてread-only参照のみ、production採用は現行binary/runtimeで再検証してから判断する)。**まだPoC実装には進んでいない。static解析のみ。** 詳細・byte-exact evidenceは`investigations/ACQUISITION_LEARNASNEW/PLAN.md`を正とする。
+
+#### CONFIRMED(`rstUpdateSeqSkillPowerUp`全体逆アセンブル、byte-exact)
+
+- `GBWK.PUpSkillResult`(+0x4B)による分岐は`1`(ordinary)/`2`(mutation)で**ほぼ完全に対称なnativeコード**を通る。両方とも同一managed method`rstupdate.rstOverWriteSkill`(VA `0x182285FF0`)を呼び、`&pCurrentStock.skill[PUpSkillIndex]`へ`GBWK.PUpSkillID`(+0x4E)を書き込む。この`rstOverWriteSkill`呼び出しが上書き不可逆化の唯一の地点(呼び出し前は読み取り専用処理のみ)。
+- 呼び出し直後の3つのpresentation call(`0x182281a80`/`0x18227c080`/`0x182280a50`)はordinary/mutation共通、その後`GBWK.Flag`(+0x7E)へ`1`(ordinary)/`2`(mutation)を書き込み、最後に`PUpSkillResult=0xFF`(消費マーク)を書いて共通tailへ収束する。
+- **訂正**: `FullCapacityAddNewBridgePoc.cs`の旧コメント「`GBWK.Flag = 1 (ordinary) or 4 (mutation)`」は誤りと判明。正しくは`1`/`2`。`Flag==4`は別の早期bail分岐(`PUpSkillResult`チェックより前のゲート、`0x18216a490`の戻り値が1のケース)で書かれる値であり、Mutationの意味ではない(前述bit6 CLEAR writerのSite1条件`Flag==4`とは別文脈、混同注意)。
+- `rstOverWriteSkill`はPower-Up AddNewで既に実戦投入済みの`FullCapacityOverwriteSuppressor`の介入点と同一managed methodであり、Mutation呼び出しサイトも構造的には同じ機構で捕捉可能(現状Trigger側のガードが`PUpSkillResult==1`のみのためMutationには未作用)。
+
+#### CONFIRMED(`rstCalcSkillPowerUpCore`前半逆アセンブル、byte-exact)
+
+- `GBWK.PUpSkillIndex`(+0x4C)は関数冒頭、ordinary/mutation分岐(dil)より**前**に1回だけ確定し、両分岐で共有される(mutation分岐側の再write箇所なし)。`GBWK.PUpSkillID`(+0x4E)も同時に「ordinary候補値」で初期化される。
+- Mutation成立時(`cmbGetMutationSkill`、VA `0x18227B6B0`のnativeResult!=0)は、VA `0x18227E597`で`GBWK.PUpSkillID`を Mutation targetへ**上書き**する。`PUpSkillIndex`は再writeされない。
+- **構造的帰結**: Mutationは独立したslotを選ぶのではなく、常に「既に有効なordinary Power-Up候補が存在するslot」の上で成立する(`PUpSkillID==0`ならmutation分岐へ到達する前にcoreResult=0で即return)。
+- `0x1822810b0`(PUpSkillIndex/初期PUpSkillIDを設定する関数)は`rstRndGetPowerUpSkill`(VA `0x1965489A0`)へのwrapper/entryである可能性が高いが**未確定**(アドレス帯が別領域のため)。断定しない。
+
+#### 未着手(次回最優先)
+
+1. `rstAddSkill`内部ヘルパー(`0x18240DEB0`/`0x1824104E0`/`0x182410C60`)のbyte-exact解析。
+2. Mutationのoverwrite確定(`rstOverWriteSkill`呼び出し)前に、native `rstAddSkill`パイプラインへ合法的に合流できる制御点があるかの評価。
+3. seq21/22で`DefSkillResult`/`EventParam`等をPower-Up AddNewと同じ意味で使えるかの確認。
+4. seq22→8復帰時のinternal write確認(旧UNRESOLVED、継続)。
+5. `HiddenSlotCandidateInjection.cs`がMutation経由でもそのまま機能するかはUNKNOWN(未検証、backend成立後に確認)。
+
 ## Phase C: Option F result conversion — 初回実機成功(2026-09-12)
 
 Phase Bの調査(R0-A/R0-B/R0-Cのnative CFG、`investigations/REPEAT_UNLIMITED/PLAN.md`)を前提に、人間承認を得てOption F result conversionの初回candidate実装(`src/SkillMutationV3/OptionFRepeatUnlimitedControl.cs`)を実施し、`SkillMutation.Chance=Native / SkillPowerUp.Chance=Always / SkillPowerUp.Repeat=Unlimited`の設定で実機投入した。**詳細な生ログ・disassembly根拠は`investigations/REPEAT_UNLIMITED/PLAN.md`「Option F result conversion 初回実機成功(2026-09-12)」を正とする。ここには今後の設計判断に必要な確定事項の要約のみを記載する。**
@@ -582,7 +608,95 @@ Phase Bの調査(R0-A/R0-B/R0-Cのnative CFG、`investigations/REPEAT_UNLIMITED/
 - await系(`awaitObj`/`awaitText`、息吹の具足のケース)とdirect obtained系(`obtainedText[7]`直接差し替え、会心のケース)が同じ`target==ebx`不一致で説明できるかは未検証。
 - 最終的な修正方法(Case A/Bの切り分け結果を踏まえてから検討。「ゲームが本来持つ9番目表示経路をAddNewブリッジから正しく使う」案と、「描画ループ側にtarget==8の特別処理を追加する」案の両方が候補)。
 
-### READY FOR PRODUCTION: NO(根本原因はCONFIRMED、修正実装はまだ)
+### RESOLVED(2026-09-15) — Power-Up AddNew: READY FOR PRODUCTION = YES
+
+上記UNRESOLVEDの`r13`実体(`rstcalc.rstCreateBeforeSkillList`が返す`rstSkillInfo_t`、cpp2il型定義で確認)・そのwriter(`rstCreateBeforeSkillList`自身)を特定し、根本原因を確定した。詳細・byte-exact evidenceは`investigations/HIDDEN_SKILL_ENTRY/PLAN.md`を正とする。ここには設計判断に必要な要約のみ記載する。
+
+- **根本原因**: `cmpDrawSkill`の9番目(hidden entry)presentation blockは、`rstSkillInfo_t.SkillCnt`(+0x10)が0の場合、その入口で丸ごとスキップされる(単なる配列境界ではなくmaster gate)。`SkillCnt`は`rstCreateBeforeSkillList`が毎フレーム0へリセットした後、pStock(`datUnitWork_t`)のcurriculum配列を24候補scanし、3ゲート(tag一致/レベル閾値/所持済みでない)を通過したものだけ追加する。
+- **High Pixieがなぜ成功していたか**: `datUnitWork_t.hensinmae`(変身前種族、+0x88)が非0の変化悪魔だったため、レベル閾値の高い"今後習得予定"側のcurriculumグループ(tag=6)を参照でき、候補が1〜2件残っていた。runtime確認: `stockId=59; stockLevel=13; stockSkillCnt=8; stockHensinmae=61`。
+- **Frostがなぜ失敗していたか**: `hensinmae==0`の通常個体のため、レベル閾値が現在レベル以下しかない"消化済み"側のcurriculumグループ(tag=1)しか参照できず、3ゲートのうちレベル閾値ゲートで24候補全滅していた(gate1/gate3は問題なし、runtime確認済み)。runtime確認: `stockId=60; stockLevel=11; stockSkillCnt=8; stockHensinmae=0`。**`hensinmae`はMODから一切改変していない。**
+- **`rstSkillInfo_t`構造(cpp2il型定義+byte-exact disassembly、両面確認)**: `SkillCnt`(sbyte,+0x10)/`TargetLevel`(byte[],+0x18、`cmpDrawSkill`からは不読と確認済み)/`SkillID`(ushort[],+0x20、target==8専用pathは常に`SkillID[0]`のみを読む)。両配列ともLength=24で常に非null(Frostの`SkillCnt=0`時でも)。
+- **修正方式(2026-09-15当初)**: `src/SkillMutationV3/HiddenSlotCandidateInjection.cs`(Harmony Postfix on `rstcalc.rstCreateBeforeSkillList`)。当初はnative自身が`SkillCnt=0`のまま終わったとき、かつAddNewブリッジがActiveかつseq==21のときのみ、`SkillID[0]`/`TargetLevel[0]`/`SkillCnt=1`を後から供給する設計だった。
+- **修正方式(2026-09-15同日、追加修正)**: 上記の`SkillCnt==0`限定ガードは、hensinmae!=0のunit(native自身が既に別候補を見つけている場合、例: High Pixie)でMutation/Power-Up AddNewのtargetがハイライトされないバグを引き起こすことが判明(native自身の候補がブリッジのtargetを覆い隠すため)。**ガードを撤廃し、AddNewブリッジがActiveな間は`SkillID[0]`を常にブリッジのtargetで上書きする方式に変更**(`cmpDrawSkill`はindex 0のみを読むためCONFIRMED済み)。`SkillCnt`はnativeが既に1以上を書いていればそのまま尊重し、0のときのみ1へ引き上げる。`hensinmae`・curriculum構築・native writerはいずれも未改変。
+- **実機確認(2026-09-15)**: Frost×target=299「会心」、Frost×target=16「マハジオ」(Power-Up AddNew、初期修正時点)。追加修正後: High Pixie(hensinmae!=0)でMutation AddNew(target=32:ムド等)・Power-Up AddNew(target=39:メディア等)双方でハイライト・名前表示が正常化したことをrun time確認(`HIDDENSLOT-INJECT`ログの`unit=59`出現、および実機目視)。キャンセル→別episode再突入でstate leak無し。既存の成功ケース(Frost、High Pixie旧経路)への回帰無し。warning/errorともセッション通算0件。
+- **既知の限定事項(UNKNOWN、production運用上のブロッカーではない)**: `TargetLevel`のプレースホルダ値(`0`固定)は`cmpDrawSkill`からの不読は確認済みだが、他の未特定consumerが存在しないかは完全証明ではない。
+
+### READY FOR PRODUCTION: YES(Power-Up AddNew。2026-09-15 User確認済み。同日の追加ハイライト修正込み)
+
+## Phase D: Mutation AddNew(2026-09-15、PRODUCTION CANDIDATE、runtime validated)
+
+詳細・byte-exact evidence・設計比較は`investigations/ACQUISITION_LEARNASNEW/PLAN.md`を正とする。ここには設計判断・引き継ぎに必要な確定事項の要約のみ記載する。
+
+### 状態: PRODUCTION CANDIDATE(runtime validated、正式production昇格はUser最終承認待ち)
+
+採用設計は候補B(Power-Up AddNew本体ロジックは変更せず、同一native patternをMutation専用bridge/stateとしてzero-base並行実装。相互排他guardのみPower-Up側Triggerへ最小追加)。
+
+### CONFIRMED(byte-exact static + runtime)
+
+- `GBWK.EventParam`(+0x32、`rstData_t`)のwriterは`rstcalc.rstCalcEventInfo`(VA `0x18227C330`、実write`0x18227C5FB`)。`rstCalc`内のretry loopから呼ばれる。第二writerは全`.text`スキャンで見つからず。
+- `rstChkAddSkill`の戻り値↔`DefSkillResult`(0=owned/1=空きあり/2=満杯)は`fclCombineCalcCore.cmbChkSkillOwner`ベースで、Power-Up側と共通のprimitiveを使用。
+- `rstAddSkill`の3ヘルパー: `0x18240DEB0=cmbAddSkill`、`0x1824104E0=cmbChkKeisyoSkillOwner`、`0x182410C60=cmbDeleteKeisyoSkill`(IL2CPPメタデータVA解決でCONFIRMED)。
+- `rstUpdateSeqDestroyConfirm`(seq22)は自身の内部でskill[]圧縮→`skillcnt--`→**`rstAddSkill()`を直接呼ぶ**(VA `0x182288F69`、2つ目のcall site)。Mutation AddNewの満杯側はこの経路に合流する。
+- Calc→Updateのtiming: 空きありは同一frame内で完結。満杯側はforget UI滞在中(観測値で最大600フレーム超/約10秒)、`EventParam`/`DefSkillResult`がGBWK上に保持され続ける。
+- `DefSkillResult`はMutation bridgeから新規writeしていない(seq21/22の完了経路自体がこのfieldを参照しないため、native tail完走+タイミング遅延redirectという設計であれば不要)。
+- `Flag`/`PUpSkillResult`もMutation bridgeから一切触れない(native自身の`rstUpdateSeqSkillPowerUp` tailが確定させ、bridgeのredirectはその後に発生)。
+- 実機確認(複数unit・複数target): 満杯8枠AddNew成功(unit=59 High Pixie: target=60/22/115/4/32、unit=60 Frost: target=210/409等)、空きスロットAddNew成功(unit=103: target=400)。source skill保持・target習得・skillcnt整合・`EventParam`のnative本来値への復元、いずれも確認済み。
+- Hidden 9th slot presentation(Phase Cの`HiddenSlotCandidateInjection.cs`)はMutation bridge Activeも認識するよう拡張済み(`FullCapacityAddNewBridgeState.Active`とのOR条件)。hensinmae!=0(High Pixie)でも正常表示確認済み。
+- Ordinary Power-Up AddNewへの回帰無し(Mutation実装後も`FULLCAP-ADDNEW-COMPLETE`成功を複数回確認)。
+
+### 既知gap(Power-Up本番実装、今回は未修正)
+
+`FullCapacityAddNewBridgePoc.cs`の満杯側bridgeは、forget UIをCANCELした場合に`GBWK.EventParam`をnative本来の値へ復元する処理が無い(全ソースgrepでCONFIRMED)。Mutation側は最初からCOMPLETE/CANCEL両方で明示的にrestoreする設計にしたため、この既知gapは持ち込んでいない。Power-Up側は現状変更していない。
+
+### UNRESOLVED / 未実施
+
+- forget-skill選択UIは通常操作でキャンセルできない(User実機確認、「そのまま忘れる以外出来ない」)。CANCEL経路は通常プレイでは到達不能な可能性が高く、Mutation側の防御的cleanupコードは実質未検証のまま(production blockerにはしない)。
+- `dil`(retry loop内比較値)がコンパイル時定数0であることはCONFIRMEDだが、`rstCalcEventInfo`自身のcurriculum選択ロジック内部・`rstCalc`と`rstUpdate`の呼び出しタイミング関係(indirect dispatchのため直接xref不能、static analysisの限界)は未解明。
+- Mutation AddNewの正式production昇格(候補Aへの統合含む)はUser最終承認待ち。
+
+## Phase E: SkillPowerUp.Chance=Always × Repeat=Unlimited regression(2026-09-15、FIXED、runtime confirmed)
+
+### 発見経緯
+
+Mutation AddNewのruntime検証中、`SkillPowerUp.Chance=Always / Repeat=Unlimited / SkillMutation.Chance=Native`という設定下で、`unit=59`(High Pixie)がMutation(native `PUpSkillResult=2`)ばかり表面化し、Ordinary Power-Up(`=1`)が一度も表面化しない事象が見つかった。当初「Mutation AddNew実装自体の間接regression」の疑いも検討したが、native自身の生`PUpSkillResult`遷移ログ(Mutation AddNewのguardより前段)を確認した結果、Mutation AddNewのguardが正当な`result=1`を握り潰している形跡は無いことが判明し(`unit=59`はnative自身が`PUpSkillResult=1`を一度も生成していなかった)、既存コードの読解により真因を特定した。
+
+### CONFIRMED(根本原因)
+
+`src/SkillMutationV3/SkillPowerUpChanceControl.cs`の`SkillPowerUpChanceAlwaysPatch.Postfix`に
+
+```csharp
+if (_bit6WasSet) return;
+```
+
+というコードがあり、コード自身のコメントには「Repeat=Native only path in Phase A」と明記されていたにもかかわらず、実際のコードは`GameplaySettingsService.Repeat`を一切チェックしていなかった。Phase C(`OptionFRepeatUnlimitedControl.cs`、Repeat=Unlimited追加)実装時に、Phase Aのこの条件がRepeatモードを考慮するよう更新されていなかったことが原因。`OptionFRepeatUnlimitedControl`は`rawResult==0`(R0-A/B/C)のみを変換対象とし`rawResult==2/3`には関与しないため、bit6が既にSET状態で native CFGの「RNG失敗(dil=1)→bit6を経由せず直接Mutation attempt」経路が`rawResult=2/3`を生成した場合、どちらの変換層にもカバーされずMutationがそのまま表面化していた。
+
+### 修正
+
+```csharp
+if (_bit6WasSet && GameplaySettingsService.Repeat != "Unlimited") return;
+```
+
+Repeat=Nativeでは従来通りbit6 SET後はAlways変換をskip。Repeat=Unlimitedではbit6 SET後も2/3→1変換を継続する。`OptionFRepeatUnlimitedControl`(rawResult==0専用)とは役割が重ならないため競合しない。
+
+### CONFIRMED runtime(2026-09-15)
+
+`unit=59`(High Pixie)で`FORGET-PUPSKILL-CHANGE`を確認したところ、3/3イベント全てが`pUpResultAfter=1`となり、Mutationは一度も表面化しなかった。`unit=60`/`unit=103`では`SkillPowerUpChance Always priority applied`(2/3→1変換)が複数回正しく発火していることも確認。`[NocturneModernGameplay]`由来の`failed safely`ログは0件。
+
+### READY FOR PRODUCTION: YES(runtime confirmed。2026-09-15)
+
+## Phase F: Option F / Repeat=Unlimitedの独立した残課題(2026-09-15、UNRESOLVED、保留)
+
+Phase Eの修正とは別レイヤーの問題。`OptionFRepeatUnlimitedControl.cs`(raw `rawResult==0`→1変換)で、`OPTION-F-DECISION`ログの`exclusionObserved`フィールドが実機セッション全体を通じて常に`False`になっており、`bit6WasSet=True`のケースが一貫して`action=ABORTED_INCONSISTENT_OBSERVER`となる事象を観測した(`unit=59`/`unit=60`両方、Phase Eの修正とは独立に発生)。
+
+一時診断ログ(`OPTIONF-DIAG-EXCLUSION-HIT`/`OPTIONF-DIAG-TOTAL-CALLS`、`OptionFRepeatUnlimitedControl.cs`に追加済み)を仕込んだが、Phase Eの修正が本命症状を解決したため、この診断ログ自体はまだ活用(実機データ収集)していない。
+
+**次回優先調査**: `investigations/REPEAT_UNLIMITED/PLAN.md`側で独立調査する。`rstCreateBeforeSkillList`が`rstCalcSkillPowerUpCore`のCore-active windowの中で本当に呼ばれているか(2026-09-12時点では呼ばれていた、CONFIRMED runtime observed実績あり)を、上記診断ログで再確認するのが起点。
+
+### READY FOR PRODUCTION: N/A(production blockerではない、保留中の別機能)
+
+## Hardware breakpoint禁止事項(2026-09-15、重要)
+
+**`GBWK.EventParam`へのhardware write-breakpoint(VEH/Dr0-Dr7)による直接観測は、2回クラッシュした(`EventParamWriterCaptureProbe`、`EventParamActualWriterTrace`)。以後、`investigations/ACQUISITION_LEARNASNEW/PLAN.md`のinvestigationではこの手法を再使用しない。再開にはUserの明示承認が必要。** 両クラスとも`Enabled=false`のまま保持(ソース削除はしない)。
 
 ## 既知の別issue(記録のみ、本investigation対象外)
 

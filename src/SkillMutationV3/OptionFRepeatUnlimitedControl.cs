@@ -96,6 +96,7 @@ namespace NocturneModernGameplay
                 _exclusionObservedThisCore = false;
                 _exclusionMatchedThisCore = false;
                 _invocationCounter++;
+                _diagLoggedThisCoreWindow = false; // TEMPORARY DIAGNOSTIC, see OnExclusionListObserved
 
                 var stock = rstinit.GBWK?.pCurrentStock;
                 if (stock == null || stock.Pointer == IntPtr.Zero)
@@ -132,8 +133,43 @@ namespace NocturneModernGameplay
         // discipline - see OptionFF2Diagnostics.cs for the original
         // "Scope correction" rationale). Read-only: never writes to the
         // info object, its arrays, GBWK, or pCurrentStock.
+        // TEMPORARY DIAGNOSTIC (2026-09-15, User-directed investigation into
+        // OPTION-F-DECISION consistently showing exclusionObserved=False /
+        // ABORTED_INCONSISTENT_OBSERVER, unrelated to today's Mutation
+        // AddNew work - possible regression vs the 2026-09-12 CONFIRMED
+        // success in investigations/REPEAT_UNLIMITED/PLAN.md). Read-only,
+        // does not affect any decision - logs unconditionally every call
+        // (both _coreActive branches) so the actual call frequency/timing
+        // of rstCreateBeforeSkillList relative to rstCalcSkillPowerUpCore's
+        // own active window can be observed directly, rather than inferred.
+        // Remove once the root cause is determined.
+        private static int _diagCallCounter;
+        private static bool _diagLoggedThisCoreWindow;
+
         internal static void OnExclusionListObserved(Il2Cppresult2_H.rstSkillInfo_t info)
         {
+            _diagCallCounter++;
+            if (_diagCallCounter % 500 == 0)
+            {
+                try
+                {
+                    MelonLogger.Msg(
+                        "[NocturneModernGameplay] OPTIONF-DIAG-TOTAL-CALLS; " +
+                        $"totalCalls={_diagCallCounter}; frame={UnityEngine.Time.frameCount}.");
+                }
+                catch { /* diagnostic only */ }
+            }
+            if (_coreActive && !_diagLoggedThisCoreWindow)
+            {
+                _diagLoggedThisCoreWindow = true;
+                try
+                {
+                    MelonLogger.Msg(
+                        "[NocturneModernGameplay] OPTIONF-DIAG-EXCLUSION-HIT; " +
+                        $"totalCalls={_diagCallCounter}; coreActive=True; frame={UnityEngine.Time.frameCount}.");
+                }
+                catch { /* diagnostic only */ }
+            }
             if (!_coreActive) return;
             try
             {

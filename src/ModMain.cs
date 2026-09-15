@@ -64,39 +64,33 @@ namespace NocturneModernGameplay
             GameplayFeatureRegistry.Sample();
             StatusUiFieldOffsetProbe.TryProbe();
             SelectSkillIdOffsetProbe.TryProbe();
+            // HIDDEN NEW SKILL ENTRY investigation: CLOSED (2026-09-15, see
+            // investigations/HIDDEN_SKILL_ENTRY/PLAN.md). Root cause
+            // (Frost's ordinary, non-transformed `hensinmae==0` state means
+            // native's own curriculum scan in rstcalc.rstCreateBeforeSkillList
+            // structurally never finds a slot-9 presentation candidate,
+            // unlike a transformed demon such as High Pixie) is fully
+            // characterized, and the fix (HiddenSlotCandidateInjection.cs, a
+            // Harmony Postfix that supplies one candidate to native's own
+            // outList only when native found none) is CONFIRMED working
+            // end-to-end on real hardware with no regression on the
+            // already-working case.
+            //
             // SkillCurObjNativeCallerProbe / HighlightTargetGateTrace /
             // CursorPosShiftWriteWatchTrace / SelectSkillIdWriteWatchTrace /
             // Hidden9thSlotPathTrace / Hidden9thGateCascadeTrace /
-            // FclChkMessageResultTrace / CmpDrawSkillR13LoopBoundTrace
-            // .Tick()/FlushPendingLogs() are deliberately NOT called this
-            // session: all of these classes (plus R13FetchAndWriteWatchTrace
-            // below) install hardware breakpoints on the same DR0-DR3
-            // registers (InstallHardwareBreakpoint(s)OnCurrentThread
-            // unconditionally claims them), and running more than one at
-            // once would have the later Install() silently steal registers
-            // out from under the earlier one, breaking it without any
-            // error. This investigation's history (all CONFIRMED, see
-            // 01_CURRENT_STATE.md / investigations/HIDDEN_SKILL_ENTRY/
-            // PLAN.md for full detail) narrowed from "does the presentation
-            // function even get called" down to a single byte:
-            // CmpDrawSkillR13LoopBoundTrace found the candidate-scan loop
-            // bound ([r13+0x10] inside cmpDrawSkill) is 1 or 2 for High
-            // Pixie's succeeding AddNew-bridge case and exactly 0 for
-            // Frost's failing one (242 vs 238 hits, zero exceptions either
-            // way) - structurally meaning Frost's loop (and the dedicated
-            // target==8 path deeper in it) is skipped entirely.
-            // R13FetchAndWriteWatchTrace (below) is the active investigation
-            // now - identifying the WRITER of that count via a dynamic
-            // hardware write-watch (DR1 is reprogrammed to the current
-            // frame's [r13+0x10] every time cmpDrawStatusComEx2's fetch
-            // point fires, since `r13` is a fresh object each call and a
-            // static-address watch cannot pre-exist it), plus the
-            // earliest-observable value at fetch time and the final value
-            // cmpDrawSkill's own loop sees, all in one pass. Uninstall()
-            // below still runs for all of them so any leftover state from a
-            // prior build is cleaned up.
-            R13FetchAndWriteWatchTrace.Tick();
-            R13FetchAndWriteWatchTrace.FlushPendingLogs();
+            // FclChkMessageResultTrace / CmpDrawSkillR13LoopBoundTrace /
+            // R13FetchAndWriteWatchTrace / CurriculumGateChainTrace were this
+            // investigation's successive hardware-breakpoint (DR0-DR3)
+            // probes - each superseded the last as the root cause narrowed
+            // (full chain in PLAN.md), and none run any more now that the
+            // fix is confirmed. Left retired-but-present (Tick()/
+            // FlushPendingLogs() calls commented out, Uninstall() still
+            // called below for prior-build cleanup) rather than deleted, in
+            // case regression testing or a similar future investigation
+            // needs one of them again.
+            // CurriculumGateChainTrace.Tick();
+            // CurriculumGateChainTrace.FlushPendingLogs();
         }
 
         public override void OnDeinitializeMelon()
@@ -111,8 +105,10 @@ namespace NocturneModernGameplay
             FclChkMessageResultTrace.Uninstall();
             CmpDrawSkillR13LoopBoundTrace.Uninstall();
             R13FetchAndWriteWatchTrace.Uninstall();
+            CurriculumGateChainTrace.Uninstall();
             SkillCntWriterCaptureProbe.Uninstall();
             EventParamWriterCaptureProbe.Uninstall();
+            EventParamActualWriterTrace.Uninstall();
             GameplayFeatureRegistry.Shutdown();
         }
     }
