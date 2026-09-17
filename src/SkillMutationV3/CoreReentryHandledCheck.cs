@@ -77,6 +77,26 @@ namespace NocturneModernGameplay
                 _pUpIndexBefore = gbwk.PUpSkillIndex;
                 _captured = true;
 
+                // EPISODE LATCH (2026-09-17 root-cause fix): a Power-Up or
+                // Mutation already succeeded for this unit earlier in the
+                // same level-up episode - unconditionally suppress, REGARDLESS
+                // of which candidate this call is about. This is the gate
+                // that closes the gap ALLOW-FIRST leaves below (see
+                // HandledCandidatesObserver's EPISODE-LEVEL SUCCESS LATCH
+                // comment for the full real-machine evidence).
+                if (HandledCandidatesObserver.IsEpisodeLatched(stockPtr))
+                {
+                    __result = 0;
+                    _action = "SUPPRESS-EPISODE-LATCH";
+
+                    int frameEpisodeSuppress = UnityEngine.Time.frameCount;
+                    MelonLogger.Msg(
+                        "[NocturneModernGameplay] CORE-EPISODE-LATCH; " +
+                        $"frame={frameEpisodeSuppress}; unit={_unitBefore}; stockPtr=0x{stockPtr:X}; " +
+                        $"candidate={eventParam}; action=SUPPRESS-EPISODE-LATCH.");
+                    return false;
+                }
+
                 bool handled = HandledCandidatesObserver.IsHandled(stockPtr, eventParam);
                 if (!handled)
                 {
@@ -132,6 +152,16 @@ namespace NocturneModernGameplay
             _captured = false;
             try
             {
+                // coreResult 1 = ordinary Power-Up, 2 = Mutation success (3 =
+                // Mutation failure, 0 = no candidate) - either success arms
+                // the episode latch so any further Core call for this unit,
+                // for ANY candidate, is suppressed until a genuinely new
+                // level-up is observed (see HandledCandidatesObserver).
+                if (__result == 1 || __result == 2)
+                {
+                    HandledCandidatesObserver.MarkEpisodeSkillChangeApplied(_stockPtrBefore);
+                }
+
                 // Only log the ALLOW/SUPPRESS-relevant cases plus any
                 // meaningful (non-zero) result - avoids flooding the log
                 // with every ordinary, unrelated Core call.

@@ -802,3 +802,11 @@ backend未実装中はGUIへ表示しない。
 - Queueでの別unit再生、Inlineでのforget flow無理矢理挿入。
 - return値だけの偽装。
 - source変更・build・deploy・Git操作は、次回明示的な指示があるまで行わない。
+
+## 関連事象への横断メモ(2026-09-17、記録のみ)
+
+本investigationとは別スレッドだが、`rstUpdateSeqDestroyConfirm`(forget-confirm、seq21→22→8)のresultへの介入例として関連が深いため、ポインタのみ記録する。
+
+`01_CURRENT_STATE.md` Phase G(1 LvUp内2回Skill Power-Up統合バグ / episode latch PoC)参照。`HandledCandidatesObserver`/`CoreReentryHandledCheck`(349-zombie対策、`08a06fe`)の`ALLOW-FIRST`が、FullCapacity AddNew完了(forget-confirm解決)後の同一level-up episode再entryを、candidate識別(`EventParam`)が変わることで素通ししてしまう統合バグをCONFIRMED。`stockPtr`単位のepisode-level success latch PoCを実装したが、`GBWK.LevelUpCnt`によるclear boundaryは同一戦闘内の多重lvupケースで未検証、READY FOR PRODUCTION: NO。次回優先はTest A/B(詳細はPhase G参照)。
+
+本investigation(`Acquisition = Overwrite / LearnAsNew`)の設計評価自体には影響しない。

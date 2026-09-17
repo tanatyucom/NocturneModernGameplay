@@ -717,3 +717,56 @@ Skill Mutation V3 / Repeat=Unlimited investigation(R0-B調査)とは別issueと�
 **原因**: `HYPOTHESIS`(GUI load/save処理のbug等)。今回は原因追跡・修正のいずれも行っていない。
 
 **再現条件・影響範囲**: 未調査。
+
+## Phase G: 1 LvUp内2回Skill Power-Up統合バグ / episode latch PoC(2026-09-17、UNRESOLVED、READY FOR PRODUCTION: NO)
+
+### CONFIRMED(症状)
+
+実機ログ(`smt3hd\MelonLoader\Latest.log`、17:45:57-17:46:20、`unit=92`)で、**1回のレベルアップ内でSkill Power-Upが2回成立**することを確認した。
+
+1回目: ordinary Power-Up成立、target=メディア(39)。skillcnt=8 full capacityのためnative forget UIへ移行、プレイヤーが1スキルを忘れ、targetを新規取得(`FULLCAP-ADDNEW-COMPLETE`)。
+
+その直後、**同一level-up episode内・新規EXP event/新規level-up eventなし**で、`rstCalcSkillPowerUpCore`が再実行され、新しい候補で2回目のordinary Power-Upが成立(target=マハザン(22))。再度forget UIへ移行した(2回目)。
+
+`levelUpCnt`は1回目終了時点で`1->0`(正常消費)、2回目の不正ロール時点では既に`-1`/`-2`(負値)だった。
+
+### REJECTED(訂正した誤解釈)
+
+「`ADDNEW-POC-SKIP reason=no-capacity`が出ている = `FullCapacityAddNewBridge`が機能不全」という初期解釈は誤り。empty-slot AddNew helperがskillcnt=8 full capacity時にskipするのは正常であり、その後Power-Up成立→native forget UI→1スキル忘れる→target新規取得→skillcnt=8維持、がFullCapacity AddNewの正式仕様。今回の二重発動はFullCapacity AddNew自体の機能不全ではない。
+
+同様に「1回のLvUpでPower-Upが2回成立することが意図された仕様」も**記録しない**。`ALLOW-FIRST`という局所ガードの設計意図(349-zombie対策として、handled直後の最初のCore再entryを1回だけ許可する)と、二重Skill Changeを意図したことは別。
+
+### CONFIRMED(根本原因)
+
+`CoreReentryHandledCheck.cs`/`HandledCandidatesObserver.cs`(349-zombie対策、commit `08a06fe`)の`ALLOW-FIRST`は`(stock, EventParam)`単位のcandidate識別で「最初のCore再entryを1回許可」する設計。FullCapacity AddNew完了(forget-confirm解決)後、native が**別のcandidate識別(EventParam)**でCoreへ再entryした場合、`HandledCandidates`/`CoreConsumed`はこれを新規candidateとして認識し、ALLOW-FIRSTが素通しする。これが同一level-up episode内での2回目Power-Up成立の直接原因。**ALLOW-FIRSTの既存設計が、FullCapacity AddNew完了後の同一level-up episode再entryを1回許可してしまう統合バグ**、と分類する。
+
+### Episode-level success latch PoC(実装済み、UNRESOLVED)
+
+`stockPtr`(unit)単位の広域ガードを追加した。既存の`ALLOW-FIRST`/`HandledCandidates`/`CoreConsumed`/`DefaultSkillHandledClassificationBlock`は無改変。
+
+- **SET**: `rstCalcSkillPowerUpCore`のcoreResultが`1`(ordinary Power-Up)または`2`(genuine Mutation)の場合、`HandledCandidatesObserver.MarkEpisodeSkillChangeApplied(stockPtr)`を呼びlatchをSET(`CoreReentryHandledCheck.Postfix`)。
+- **SUPPRESS**: 同一unitでlatchがSET済みの場合、candidate IDに関係なく次回以降のCore再entryを既存`ALLOW-FIRST`/`HandledCandidates`判定より前で無条件抑止(`CoreReentryHandledCheck.Prefix`)。新規ログ: `CORE-EPISODE-LATCH; action=SUPPRESS-EPISODE-LATCH`。
+- **CLEAR**: `GBWK.LevelUpCnt`が「0以下→新たな正の値」に遷移した時点を新規level-up episode開始とみなしlatchをclear(`DefaultSkillIteratorTrace`の既存sample pointから`HandledCandidatesObserver.OnLevelUpCntObserved`を呼ぶ)。新規ログ: `EPISODE-LATCH-CLEAR`。`ResultLifecycleBoundaryObserver`(`rstCreateTargetList`境界)でも粗いフォールバッククリアを行う。
+
+変更ファイル: `src/SkillMutationV3/HandledCandidatesObserver.cs`、`src/SkillMutationV3/CoreReentryHandledCheck.cs`、`src/SkillMutationV3/DefaultSkillIteratorTrace.cs`。
+
+### UNRESOLVED(production blocker)
+
+`LevelUpCnt <= 0 → > 0`をnew episode boundaryとみなす設計は、**同一戦闘で同一unitが2レベル以上上がるケース**で未検証。`DefaultSkillHandledClassificationBlock`の既存コメントにある通り、native分類ループはcandidateをskipする度に`LevelUpCnt`をデクリメントするため、「残りLvUp回数」的semanticだった場合、1回目のlvupでlatchがSETされた後、2レベル目の正当なPower-Upまで誤って抑止する可能性がある。
+
+- Episode latchという設計思想: 妥当、strong candidate。
+- `LevelUpCnt`によるclear boundary: UNRESOLVED、要runtime確認。
+- **READY FOR PRODUCTION: NO**
+
+### 次回最優先runtime test
+
+1. **Test A(二重発動再現ケース)**: 1回目Power-Up成立→episode latch SET→同一LvUp内Core再entry→`CORE-EPISODE-LATCH; action=SUPPRESS-EPISODE-LATCH`→2回目forget UIが出ないこと、source preserved、target acquired、skillcnt=8、warning/errorなしを確認。
+2. **Test B(同一unitの2レベル以上同時LvUp、最重要)**: 意図的に大量EXPを与え、同一仲魔が1戦闘で2レベル以上上がるケースを作る。LvUp #1でSkill Change可能、LvUp #2で`EPISODE-LATCH-CLEAR`が正しい境界で出てSkill Changeが可能であることを確認。
+3. Test B失敗時のみ`LevelUpCnt`以外のnative episode boundaryを再調査する(ALLOW-FIRST全面削除には戻らない)。
+4. Test A/B成功後、episode latchをproduction candidateへ昇格判断する。
+
+Option F(`exclusionObserved=False`、Phase F参照)の調査は、この検証より後でよい。
+
+### Diagnostic状態
+
+`DefaultSkillIteratorTrace`は`Enabled=true`のまま(Test A/Bに必要)。**Hardware breakpoint系(`EventParamWriterCaptureProbe`/`EventParamActualWriterTrace`/VEH/DR0-DR7)は過去2回クラッシュ済みにつき、User明示承認なしで再使用禁止**(既存禁止事項、継続)。

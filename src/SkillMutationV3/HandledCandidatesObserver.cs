@@ -85,6 +85,69 @@ namespace NocturneModernGameplay
         // current set size only, never clears or mutates anything.
         internal static int DebugCount => HandledCandidates.Count;
 
+        // EPISODE-LEVEL SUCCESS LATCH (2026-09-17, real-machine log: unit=92,
+        // 17:45:57-17:46:20). Separate from the per-candidate
+        // HandledCandidates/CoreConsumed pair above. ALLOW-FIRST is correct
+        // for its own narrow purpose (letting the ordinary roll that follows
+        // a forget decision through), but it is keyed by (stock, EventParam)
+        // - so when that forget-confirm episode hands native back into
+        // rstCalcSkillPowerUpCore under a DIFFERENT candidate identity than
+        // the one that already succeeded, HandledCandidates/CoreConsumed
+        // never recognizes it as a repeat, and a SECOND, fully independent
+        // Power-Up succeeds within the SAME level-up. Confirmed symptom:
+        // unit=92 got two full forget-and-learn cycles from one level
+        // (GBWK.LevelUpCnt observed 1->0 for the legitimate roll, then
+        // already -1/-2 by the second, spurious one - see
+        // DefaultSkillHandledClassificationBlock's own note that the
+        // classification loop decrements LevelUpCnt on every skip, so a
+        // negative reading here means the loop is iterating past what any
+        // real granted level justifies).
+        //
+        // Keyed by stockPtr ONLY (one unit, not one candidate): once ANY
+        // Core call succeeds (coreResult==1 ordinary Power-Up or ==2
+        // Mutation - see CoreReentryHandledCheck.Postfix) for a unit, no
+        // further Core call may succeed for that unit until a genuinely NEW
+        // level-up is confirmed via OnLevelUpCntObserved below. NOT yet
+        // confirmed against a real "two genuine level-ups in one battle"
+        // case - the LevelUpCnt-rise clear boundary needs real-machine
+        // testing for that scenario specifically before this can be
+        // considered fully proven.
+        private static readonly Dictionary<long, bool> EpisodeSkillChangeApplied = new();
+        private static readonly Dictionary<long, short> EpisodeLastLevelUpCnt = new();
+
+        internal static bool IsEpisodeLatched(long stockPtr) =>
+            EpisodeSkillChangeApplied.TryGetValue(stockPtr, out bool latched) && latched;
+
+        internal static void MarkEpisodeSkillChangeApplied(long stockPtr)
+        {
+            EpisodeSkillChangeApplied[stockPtr] = true;
+        }
+
+        // Called from DefaultSkillIteratorTrace, which already samples
+        // GBWK.LevelUpCnt every rstCalcEventInfo call. A rise from a <=0
+        // baseline to a fresh positive value is the signal that native just
+        // granted an actual new level for this unit (the classification loop
+        // only ever decrements LevelUpCnt on its own - see
+        // DefaultSkillHandledClassificationBlock - so a rise cannot be
+        // explained by loop bookkeeping alone).
+        internal static void OnLevelUpCntObserved(long stockPtr, short levelUpCnt)
+        {
+            if (stockPtr == 0) return;
+
+            if (EpisodeLastLevelUpCnt.TryGetValue(stockPtr, out short last) &&
+                last <= 0 && levelUpCnt > last && levelUpCnt > 0)
+            {
+                if (EpisodeSkillChangeApplied.Remove(stockPtr))
+                {
+                    MelonLogger.Msg(
+                        "[NocturneModernGameplay] EPISODE-LATCH-CLEAR; " +
+                        $"stockPtr=0x{stockPtr:X}; reason=LevelUpCnt {last}->{levelUpCnt} (new level detected).");
+                }
+            }
+
+            EpisodeLastLevelUpCnt[stockPtr] = levelUpCnt;
+        }
+
         // SUPPRESSION POC: clear boundary, wired to rstinit.rstCreateTargetList
         // (see ResultLifecycleBoundaryObserver). Confirmed this session (one
         // real-machine case) NOT to fire mid-sequence during a full
@@ -101,6 +164,14 @@ namespace NocturneModernGameplay
             HandledCandidates.Clear();
             FirstSeenFrame.Clear();
             CoreConsumed.Clear();
+
+            // Coarser safety net for the episode latch, in addition to the
+            // finer-grained LevelUpCnt-rise clear in OnLevelUpCntObserved -
+            // guards against a stale latch surviving into an unrelated later
+            // result lifecycle if the LevelUpCnt heuristic ever misses a case.
+            EpisodeSkillChangeApplied.Clear();
+            EpisodeLastLevelUpCnt.Clear();
+
             return (handledCleared, consumedCleared);
         }
 

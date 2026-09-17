@@ -123,6 +123,12 @@ namespace NocturneModernGameplay
                 short levelUpCntAfter = gbwk.LevelUpCnt;
                 sbyte pUpResultAfter = gbwk.PUpSkillResult;
 
+                // Feeds the episode-latch clear boundary (see
+                // HandledCandidatesObserver.OnLevelUpCntObserved) - this is
+                // the existing, already-proven sample point for
+                // GBWK.LevelUpCnt, reused rather than adding a new hook.
+                HandledCandidatesObserver.OnLevelUpCntObserved(stockPtrAfter, levelUpCntAfter);
+
                 int frame = UnityEngine.Time.frameCount;
 
                 MelonLogger.Msg(
