@@ -55,6 +55,14 @@ namespace NocturneModernGameplay
         private static ushort _pUpIdBefore;
         private static sbyte _pUpIndexBefore;
 
+        // MULTI-LEVEL EPISODE BOUNDARY TRACE PoC (2026-09-19) - real level
+        // (stock.level, datUnitWork_s+0x24) and LevelUpCnt/bit6 captured
+        // alongside the existing fields above, for the MULTILEVEL-CORE log
+        // only. Does not affect any suppression/latch decision.
+        private static ushort _levelBefore;
+        private static short _levelUpCntBefore;
+        private static bool _bit6Before;
+
         private static bool Prefix(ref sbyte __result)
         {
             _captured = false;
@@ -75,6 +83,9 @@ namespace NocturneModernGameplay
                 _seqBefore = gbwk.SeqInfo.Current;
                 _pUpIdBefore = gbwk.PUpSkillID;
                 _pUpIndexBefore = gbwk.PUpSkillIndex;
+                _levelBefore = stock.level;
+                _levelUpCntBefore = gbwk.LevelUpCnt;
+                _bit6Before = (stock.flag & 0x40) != 0;
                 _captured = true;
 
                 // EPISODE LATCH (2026-09-17 root-cause fix): a Power-Up or
@@ -162,16 +173,42 @@ namespace NocturneModernGameplay
                     HandledCandidatesObserver.MarkEpisodeSkillChangeApplied(_stockPtrBefore);
                 }
 
-                // Only log the ALLOW/SUPPRESS-relevant cases plus any
-                // meaningful (non-zero) result - avoids flooding the log
-                // with every ordinary, unrelated Core call.
-                if (_action == "PASSTHROUGH-NOT-HANDLED" && __result == 0) return;
-
                 var gbwk = rstinit.GBWK;
                 int frame = UnityEngine.Time.frameCount;
                 int seqAfter = gbwk?.SeqInfo.Current ?? -1;
                 ushort pUpIdAfter = gbwk?.PUpSkillID ?? (ushort)0;
                 sbyte pUpIndexAfter = gbwk?.PUpSkillIndex ?? 0;
+
+                // MULTI-LEVEL EPISODE BOUNDARY TRACE PoC: unlike
+                // CORE-REENTRY-HANDLED-CHECK below, this is emitted for
+                // EVERY rstCalcSkillPowerUpCore invocation, unconditionally
+                // - per explicit instruction, since Core invocations are
+                // themselves the rare, meaningful event under study here
+                // (12 occurrences across a ~46-minute real session in the
+                // preserved pre-latch log). coreResultNative is "N/A" on the
+                // two SUPPRESS-* actions because native's body never ran in
+                // those cases (see Prefix) - there is no native result to
+                // report separately from the forced override.
+                bool suppressed = _action.StartsWith("SUPPRESS", StringComparison.Ordinal);
+                string coreResultNative = suppressed ? "N/A" : __result.ToString();
+                bool episodeLatchAfter = HandledCandidatesObserver.IsEpisodeLatched(_stockPtrBefore);
+                // Gated by the same flag as MultiLevelEpisodeBoundaryTrace's
+                // MULTILEVEL-STATE (disabled for production 2026-09-19, kept
+                // as a diagnostic asset - see 01_CURRENT_STATE.md Phase H).
+                if (MultiLevelStateTransitionTrace.Enabled)
+                MelonLogger.Msg(
+                    "[NocturneModernGameplay] MULTILEVEL-CORE; " +
+                    $"frame={frame}; unit={_unitBefore}; stockPtr=0x{_stockPtrBefore:X}; " +
+                    $"level={_levelBefore}; levelUpCnt={_levelUpCntBefore}; " +
+                    $"coreResultNative={coreResultNative}; coreResultAfter={__result}; " +
+                    $"pUpSkillIndex {_pUpIndexBefore}->{pUpIndexAfter}; " +
+                    $"pUpSkillId {_pUpIdBefore}->{pUpIdAfter}; " +
+                    $"bit6={_bit6Before}; episodeLatch={episodeLatchAfter}; action={_action}.");
+
+                // Only log the ALLOW/SUPPRESS-relevant cases plus any
+                // meaningful (non-zero) result - avoids flooding the log
+                // with every ordinary, unrelated Core call.
+                if (_action == "PASSTHROUGH-NOT-HANDLED" && __result == 0) return;
 
                 MelonLogger.Msg(
                     "[NocturneModernGameplay] CORE-REENTRY-HANDLED-CHECK; " +

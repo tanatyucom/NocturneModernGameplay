@@ -181,6 +181,24 @@ namespace NocturneModernGameplay
             if (SkillPowerUpChanceControl.Mode != NativeChanceMode.Always) return;
             LastOriginalCandidateSkillId = __result;
         }
+
+        // Real-machine regression (2026-09-19, see SkillPowerUpAlwaysEpisode
+        // Guarantee.cs): relying on HarmonyLib's postfix priority ordering
+        // to guarantee SkillPowerUpAlwaysEpisodeGuarantee's Postfix runs
+        // strictly after SkillPowerUpChanceAlwaysPatch's proved unreliable
+        // in this environment - two independent attempts, opposite
+        // priority values, produced the IDENTICAL observed execution order
+        // (this class's own native roll was always captured, and
+        // SkillPowerUpChanceAlwaysPatch's restore always overwrote the
+        // fallback target, regardless of Priority.Last vs Priority.First).
+        // Rather than continue fighting an unpredictable ordering, keep
+        // this field itself in sync: whenever the episode-guarantee's own
+        // Phase B picks a genuine fallback target, it calls this so that
+        // IF SkillPowerUpChanceAlwaysPatch's restore runs after all, it
+        // restores to the SAME value already set - a no-op instead of a
+        // silent corruption back to the stale, pre-fallback candidate
+        // (which was 0/"Reserve" in the observed regression).
+        internal static void SyncFallbackTarget(ushort target) => LastOriginalCandidateSkillId = target;
     }
 
     // Always priority (per this session's corrected spec): whenever
@@ -245,6 +263,31 @@ namespace NocturneModernGameplay
             }
         }
 
+        // Exemption for SkillPowerUpAlwaysEpisodeGuarantee's Phase B
+        // (2026-09-19, User-directed design: "Power-UpできるならPower-Up.
+        // Power-UpできないならMutation" - once Phase B has been reached,
+        // it already means no valid ordinary Power-Up candidate existed at
+        // all, so a genuine Mutation success there must stay a Mutation,
+        // not get relabeled as an ordinary Power-Up the way a genuine
+        // native dil=1 success does under this same Always setting).
+        // Real-machine evidence this responds to: unit=97, native
+        // cmbGetMutationSkill(original=13:"ジオ") legitimately returned
+        // 36:"ディア" (a correct, native-sanctioned but cross-family
+        // Mutation result) - this class's own conversion then relabeled it
+        // as "Skill Power-Up: ジオ→ディア", which reads as nonsensical to a
+        // player since ordinary Power-Up is expected to stay within one
+        // family. Phase B sets this flag immediately before setting its
+        // own __result=2, and this Postfix consumes (clears) it the first
+        // time it is observed, regardless of whether this Postfix happens
+        // to run before or after Phase B's own Postfix in a given build
+        // (HarmonyLib's postfix ordering between these two specific
+        // patches proved unpredictable this session - see
+        // SkillPowerUpChanceCandidateCapture.SyncFallbackTarget's own
+        // comment for the same finding). Only Phase A (ordinary Power-Up
+        // retry) and genuine native dil=1 successes remain subject to this
+        // conversion - unchanged.
+        internal static bool SuppressNextMutationConversion;
+
         private static void Postfix(ref sbyte __result)
         {
             if (SkillPowerUpChanceControl.Mode != NativeChanceMode.Always || !_captured) return;
@@ -254,6 +297,12 @@ namespace NocturneModernGameplay
             // Repeat=Unlimited: bit6 already being SET does not end the
             // cycle - keep converting (see class-level comment above).
             if (_bit6WasSet && GameplaySettingsService.Repeat != "Unlimited") return;
+
+            if (SuppressNextMutationConversion)
+            {
+                SuppressNextMutationConversion = false;
+                return;
+            }
 
             try
             {

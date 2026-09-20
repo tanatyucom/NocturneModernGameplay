@@ -41,7 +41,7 @@ namespace NocturneModernGameplay
     internal static class ExperienceMultiplierDiagnostics
     {
         internal static readonly bool Enabled = true;
-        internal const int Multiplier = 10;
+        internal const int Multiplier = 1;
 
         private static void Postfix(int stock, int exp, ref int __result)
         {

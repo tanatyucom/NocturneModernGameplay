@@ -770,3 +770,139 @@ Option F(`exclusionObserved=False`、Phase F参照)の調査は、この検証�
 ### Diagnostic状態
 
 `DefaultSkillIteratorTrace`は`Enabled=true`のまま(Test A/Bに必要)。**Hardware breakpoint系(`EventParamWriterCaptureProbe`/`EventParamActualWriterTrace`/VEH/DR0-DR7)は過去2回クラッシュ済みにつき、User明示承認なしで再使用禁止**(既存禁止事項、継続)。
+
+## Phase H: SkillPowerUp.Chance=Always 正式仕様確定 / early exclusion根本原因 / per-episode single-roll確認(2026-09-19、FIXED、runtime confirmed)
+
+### 発見経緯
+
+「カハク(unit=91)がSkillPowerUp.Chance=Always設定下でも、同一save・同一戦闘条件でSkill Changeが起きたり起きなかったりする」という実プレイ由来の違和感から調査を開始した。当初はepisode latch(Phase G)やGBWK.Flag(+0x7E)周辺を疑ったが、最終的に全く別の、より根本的な native仕様に到達した。
+
+### CONFIRMED: Multi-Level-Up は per-episode single-roll(Phase Gの残課題への回答)
+
+実機ログ(10倍EXPブースト`ExperienceMultiplierDiagnostics.cs`を用いた意図的multi-level-upテスト)で、同一戦闘内で1〜6Lv上がった4ユニットを観測した結果、**delta(1〜6)に関係なく、`rstCalcSkillPowerUpCore`の呼出は常に1回だけ**だった(4/4で一貫)。呼出後、残っている`GBWK.LevelUpCnt`の値(0〜5相当)は消費されずそのままepisodeが終了する。
+
+これはPhase Gの「`LevelUpCnt<=0→>0`をclear boundaryとする設計が、同一戦闘で2レベル以上上がるケースで正当な2回目のSkill Changeを誤って抑止しないか」というUNRESOLVED懸念に対する部分的な回答になる: **native自身がそもそも1 level-up episodeにつき1回しかCoreを呼ばないため、「2回目の正当なSkill Change」という事象自体が(今回観測した範囲では)発生しない**。ただし`CORE-EPISODE-LATCH`(SUPPRESS発火)はこのセッション群を通じて一度も観測されておらず、Phase Gの Test A(SUPPRESSが実際に正しく機能する場面)は依然未実証のまま。episode latchの設計自体を否定する材料ではないが、「二重発動を積極的に抑止した実例」はまだ無い。
+
+### CONFIRMED: `GBWK.Flag`(+0x7E)はSkillPowerUp専用ではない、Hearts-event等と共有される別系統
+
+静的解析(xref scan、14関数を特定)により、`GBWK.Flag`は`rstUpdateSeqSkillPowerUp`の「classification result(0-4)」としてだけでなく、`rstUpdateSeqHeartsMaster`(VA `0x18228BC20`、進入時Flag∉{0,1}なら`inc`する経路が存在)や`rstUpdateSeqDevilParam`(VA `0x182289770`、Flagを開始indexとして`GBWK+0x80`が指す6要素配列を探索し、該当があれば`index+1`をFlagへ書く)など、複数の戦闘後イベントSeq関数から共有されるバイトであることが判明した。
+
+`GBWK+0x80`配列への唯一のwriterは`rstSetHeartsEvent`(`rstUpdateSeqHeartsEvent`が`GBWK.Flag==3`の時のみ呼ぶ)。そのEventType引数(`GBWK+0x39`)のwriterの一つ(VA `0x18227E9A0`)を逆アセンブルした結果、**確認済みRNG関数(`0x1821690d0`)を2回呼び出して値を決定していることをCONFIRMED**(2回目呼出はGBWK経由の重み付きテーブルからのindex抽選)。
+
+既存Canonicalが言う「seq=11、~1/3 RNGロール、`GBWK+0x7a`(event-type reservation)」は、`rstCalc`側の**別の独立したSeqInfo dispatchテーブル**(`rstUpdate`側とは別物、両方が同じ`SeqInfo.Current`を読む)に実在することを直接逆アセンブルで再確認したが、**`GBWK+0x7a`と`GBWK+0x39`は接続しない別系統**(前者はGiftイベント`rstUpdateSeqGift`、後者はHeartsイベント`rstUpdateSeqHeartsEvent`)であることも確認した。
+
+**結論**: このHearts/DevilParam/GBWK.Flag系統はSkill Power-Up/Mutationの成否には直接関与しない別のゲームメカニクスだった。調査自体は「同じ`GBWK.Flag`バイトを複数のnative Seq関数が共有し、RNGで駆動される」という設計の正しい切り分けとして価値があるが、カハクの本題(下記)とは別問題である。
+
+### CONFIRMED(根本原因): early exclusion が dil roll より手前で rawResult=0 を確定させる
+
+`rstCalcSkillPowerUpCore`(VA `0x18227E100`)の実際の処理順序を完全逆アセンブルした結果:
+
+```
+1. rstRndGetPowerUpSkill(pStock, &PUpSkillIndex) -> PUpSkillID
+   (VA 0x18227E15A/0x18227E15F。無条件・最速部、dilより完全に手前)
+   所持スキルをscanし、各skillIDをcmbGetPowerUpSkill(skillID)へ渡し、
+   戻り値(強化先ID)の候補プールからRNGで1つを選ぶ。
+   PUpSkillID==0 -> return 0 (R0-A)
+
+2. rstCreateBeforeSkillList(...) (VA 0x18227E261。同じく無条件・dilより手前)
+   「現在レベルで本来もう習得済みであるべき」curriculum候補群("before list")を構築。
+
+3. PUpSkillIDがbefore listに一致 (VA 0x18227E293) -> return 0 (R0-B)
+   *** ここがdil rollより手前 ***
+
+4. dil roll (VA 0x18227E305、RNG 0x1821690d0、約50/50)
+   dil=0 -> ordinary Power-Up(bit6 test含む) / dil=1 -> Mutation(cmbGetMutationSkill)
+```
+
+**`SkillMutationChanceControl`のAlwaysパッチ(dilを1へ強制する3箇所のNOP/書換)は、手順3の時点で既にCoreがreturnしているケースには一切効かない。** dil roll自体に到達しないため。
+
+カハクの場合、所持スキルのうち1つの強化先が「マハラギ」(skill4)であり、これは同時にカハクの現在レベルで既習得済み扱いのbefore-listにも該当する。**候補選定RNGがこの所持スキルを引いた回だけ、dilに到達する前にrawResult=0で終了する。** 別の所持スキルが選ばれた回は正常にdil rollへ進み成功する。同一save・同一unitでも試行毎に結果が変わっていたのは、この候補選定RNGの偶然の一致によるもので、native側の2つの独立した仕組み(Power-Up強化先抽選 / curriculum既習得チェック)が衝突しているだけであり、バグではない。
+
+**この発見過程自体が静的REで到達し、実機診断(`ALWAYSDIL-PROBE`: 3パッチのライブbytesが常に正しく適用されていたこと、`PUpSkillID`がCore呼出ごとに新規に書き換わること)で直接裏付けられている。**
+
+### 正式仕様(修正後)
+
+```
+SkillPowerUp.Chance=Always:
+「有効なSkill Change候補が1つでも存在する限り、
+ 1 level-up episodeにつき必ず1回Skill Changeを成立させる」
+
+SkillPowerUp.Repeat=Unlimited:
+次のlevel-up episodeでも再びSkill Change可能にする(この判定とは独立)。
+
+SkillMutation.Chance=Always:
+native Coreがdil roll自体に到達した場合、その内部判定をMutation側へ強制する
+(early exclusionで到達しなかった場合には無関係)。
+```
+
+native RNG経路の成功率100%化ではなく、「native Core自体の直接成功を優先し、rawResult=0(early exclusion等)になった場合のみfallbackする」という per-episode success guarantee である。
+
+### 実装(`src/SkillMutationV3/SkillPowerUpAlwaysEpisodeGuarantee.cs`、新規1ファイル)
+
+`rstCalcSkillPowerUpCore`のPostfix(`[HarmonyPriority(Priority.Last)]`、他の全Always変換の後に実行)。`SkillPowerUp.Chance==Always`かつ最終`__result==0`の場合のみ発火。
+
+- **Phase A(Power-Up retry)**: 所持スキルをscanし`cmbGetPowerUpSkill`で強化先候補を列挙、既所持ターゲットを除外した distinct候補集合を事前計算。`rstCalcSkillPowerUpCore()`を直接再呼出し(完全に独立したHarmony-wrapped呼出、手動ロジック代替ではない)、**候補集合を全て観測し終えるまで**継続(blind N回retryではない)。
+- **Phase B(Mutation fallback)**: Phase Aの候補集合が空/使い切った場合のみ、所持スキル各々に`cmbGetMutationSkill(ownedSkillId, stock)`を直接呼出し(native自身が内部で乱数探索するためmod側の候補テーブル再現は不要)。成功時は`PUpSkillIndex`/`PUpSkillID`を手動設定、`__result=2`。bit6は native自身のMutation成功tailと同じく触らない。
+- **Phase C**: Mutation候補も無ければ`__result=0`のまま、不発を許可。
+- Priority.Lastで実行するため、`CoreReentryHandledCheck`のepisode latch SETがPhase B成功に間に合わない — Phase B成功パスでのみ`HandledCandidatesObserver.MarkEpisodeSkillChangeApplied`を明示的に呼び直して整合性を維持。
+- ログ: `ALWAYS-EPISODE-GUARANTEE`(candidate数、fallbackType、finalResult、episode latch前後を記録)。
+
+### Harmony再帰安全監査(CONFIRMED)
+
+`rstCalcSkillPowerUpCore`への既存パッチ9件を監査。有効なもの(`CoreReentryHandledCheck`/`OptionFRepeatUnlimitedControl`/`SkillPowerUpChanceControl`/`MutationDisabledBit6Guard`)は全てPrefix毎に状態リセットする設計でネスト呼出に対して安全。`SkillMutationAlways`/`OptionFF2Diagnostics`/`PowerUpMutationCfgDiagnostics`/`SkillWriterBoundaryTrace`は無効化済み(Enabled=false or未Initialize)で無関係。本実装自身は`_retryInProgress`ガードで自己再帰を防止。
+
+### CONFIRMED runtime(2026-09-19、同一save・同一unit=91、3エピソード)
+
+| Episode | Core呼出回数 | 結果 | ALWAYS-EPISODE-GUARANTEE |
+|---|---|---|---|
+| 1 | 1回(native直成功) | `coreResultNative=2` | 発火なし |
+| 2 | 3回(失敗→失敗→Phase A retry成功) | `finalResult=1`(Mutation成功→既存Always変換でordinary化) | 発火(`fallbackType=powerup-alternate`) |
+| 3 | 1回(native直成功) | `coreResultNative=2` | 発火なし |
+
+3/3エピソードで`SKILLPOWERUP-REACHED`到達・`ADDNEW-POC-COMMIT`成立(いずれも「パトラ→メパトラ」、skillCnt 3→4)。`CORE-EPISODE-LATCH`(1episode内二重成立の抑止)は0件発火 = 二重成立自体が起きなかった。`NocturneModernGameplay`由来のWarning/Exceptionは0件(ログ中の59件は全て他Mod由来の無関係ノイズ)。retry暴走(上限到達)なし。
+
+### Phase B: Mutation成功のラベル整合性(2026-09-19、FIXED、runtime confirmed)
+
+正式仕様をさらに明確化した:
+
+```
+Phase A: 有効な通常Power-Up候補あり → Power-Up成立 → result=1
+Phase B: 通常Power-Up候補が成立不能 → Mutation fallback → result=2のまま維持
+Phase C: Power-UpもMutationも不可 → result=0、不発を許可
+```
+
+Phase Bで`cmbGetMutationSkill`が系統無関係な変化(例: 原スキル「ジオ」→Mutation先「ディア」)を返すのはnative自身の正当な挙動(Mutationは元々系統無関係な変化を起こしうる機能)。問題は、既存の`SkillPowerUpChanceAlwaysPatch`(Phase E、"PowerUp.Chance=Alwaysならgenuine Mutationも通常Power-Upへ再ラベルする"という既存設計)がPhase Bの成立にも無差別に適用され、「ジオがPower-Upしてディアになった」という意味不明な表示を生んだ(2026-09-19、user実機報告)。
+
+**修正**: `SkillPowerUpChanceAlwaysPatch`に`SuppressNextMutationConversion`フラグを追加。Phase B成功時にこのフラグをセットし、後続(実行順不定)の2→1変換を1回だけ消費・スキップする。Phase A(通常Power-Up)・native自身のdil=1成功は従来通り変換対象のまま。
+
+### 2つの回帰と、そこから得られた設計原則(2026-09-19、両方FIXED)
+
+**回帰1: HarmonyLibのpostfix実行順は、この2パッチ間で`[HarmonyPriority]`を変更しても一切変化しなかった。**
+`Priority.Last`→`Priority.First`と2回試したが、両方とも「`SkillPowerUpAlwaysEpisodeGuarantee`のPostfixが先、`SkillPowerUpChanceAlwaysPatch`が後」という同一順序になり、後者が前者の設定した`PUpSkillID`(Phase B fallback target)を、stale(古い)候補値(しばしば0="リザーブ")で上書きする実害バグを2回発生させた。**教訓**: この環境ではHarmonyの複数postfix間の実行順序をpriority属性だけで確実に制御できると仮定しない。**修正方針**: 実行順に賭けるのではなく、上書き元となる共有state(`SkillPowerUpChanceCandidateCapture.LastOriginalCandidateSkillId`)自体をfallback成立時に同期する(`SyncFallbackTarget`)、または明示的なフラグで対象パッチの変換をスキップさせる(`SuppressNextMutationConversion`)、という**実行順序に依存しない設計**へ倒すこと。
+
+**回帰2: 新規追加したpostfixが、同一native関数上の既存の重複防止機構(episode latch)を考慮しなかったことによる349-zombie型の再発。**
+`CoreReentryHandledCheck`はepisode latch SET後の再entryを`SUPPRESS-EPISODE-LATCH`で正しく抑止し`__result=0`を自らセットするが、`SkillPowerUpAlwaysEpisodeGuarantee`はこの`__result=0`を「genuine失敗」と誤認し、抑止されるべき再entryのたびに独立してfallbackを再構築していた(1エピソード内で最大5回の余分な成立を観測)。**教訓**: 同一native関数に新規postfixを追加する際は、「自分がstateをどう変更するか」だけでなく「既存の他patchが持つ重複防止/抑止stateを、自分も読んで尊重すべきか」を明示的に監査項目に含めること。**修正**: `SkillPowerUpAlwaysEpisodeGuarantee`の冒頭で`HandledCandidatesObserver.IsEpisodeLatched(stockPtr)`を確認し、既にlatch済みなら即returnする契約を追加。
+
+**Canonical契約として明記**: Always Episode Guaranteeは、既にepisode latch済みのCore result=0をfallback対象として扱ってはならない。
+
+### CONFIRMED runtime(2026-09-20、最終確認、複数unit・複数episode)
+
+10倍EXPデバッグ装置(`ExperienceMultiplierDiagnostics.Multiplier=10`、テスト後`1`へ復元)を用いた実機セッションで、`ALWAYS-EPISODE-GUARANTEE`が12回発火(unit=92×4、unit=97×3、unit=59×2、unit=91×1、unit=137×1、unit=126×1、複数の独立したepisodeにまたがる):
+
+| fallbackType | 件数 | 検証結果 |
+|---|---|---|
+| powerup-alternate | 6 | 全6件、後続`SkillPowerUpChance Always priority applied`が同一frame・同一target IDで発火(`SyncFallbackTarget`により無害化を確認) |
+| mutation | 6 | 全6件、後続変換ログが一切発火せず(`SuppressNextMutationConversion`により正しく抑止) |
+
+- skill ID 0("リザーブ")の実コミットは0件
+- 同一episode内の多重成立(ゾンビ)は0件(`episodeLatchBefore`は12件全てFalse = 毎回正当な新規episode)
+- 同一unitが複数回(最大4回)、別々のepisodeで再度Guaranteeを利用できており、latchのCLEARが次episodeへ正しく引き継がれていることを実証
+- `NocturneModernGameplay`由来のWarning/Exception/failed safelyは0件
+- `ADDNEW-POC-COMMIT`等で実際のskill付与も確認済み
+
+### READY FOR PRODUCTION: YES(2026-09-20、runtime confirmed、複数unit・複数episode・2件のregression修正込み)
+
+### 次のステップ
+
+1. 診断ログのうちproductionに残すもの/落とすものを整理(`ALWAYSDIL-PROBE`等、本調査専用の一時診断は削除候補) — 2026-09-19実施済み(`GbwkFlagTransitionTrace`/`AlwaysModeDilContradictionProbe`/`MultiLevelEpisodeBoundaryTrace`は`Enabled=false`でソース保持、`ALWAYS-EPISODE-GUARANTEE`はproductionログとして維持)
+2. Git保全(2026-09-20、User承認済み)

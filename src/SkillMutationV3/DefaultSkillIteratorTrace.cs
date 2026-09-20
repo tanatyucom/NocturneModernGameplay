@@ -131,6 +131,18 @@ namespace NocturneModernGameplay
 
                 int frame = UnityEngine.Time.frameCount;
 
+                // MULTI-LEVEL EPISODE BOUNDARY TRACE PoC: transition-driven
+                // only (see MultiLevelStateTransitionTrace) - reuses this
+                // already-open gbwk/stock rather than adding a new Harmony
+                // patch. Real level (not LevelUpCnt-inferred) is read
+                // directly from stock.level (datUnitWork_s+0x24).
+                ushort levelNow = stock?.level ?? 0;
+                bool bit6Now = stock != null && stock.Pointer != IntPtr.Zero &&
+                    (stock.flag & 0x40) != 0;
+                MultiLevelStateTransitionTrace.Observe(
+                    frame, unitAfter, stockPtrAfter, levelNow, levelUpCntAfter,
+                    seqCurrentAfter, seqLastAfter, gbwk.TargetIndex, gbwk.TargetCnt, bit6Now);
+
                 MelonLogger.Msg(
                     "[NocturneModernGameplay] DEFAULTSKILL-ITERATOR-CALL; " +
                     $"frame={frame}; unit={_unitBefore}->{unitAfter}; " +
