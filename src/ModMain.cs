@@ -39,9 +39,7 @@ namespace NocturneModernGameplay
             GetDefaultSkillCallBoundaryTrace.LogPatchStatus();
             SkillDrawListEntryTrace.LogPatchStatus();
             SkillNameCostDrawFieldTrace.LogPatchStatus();
-            SkillCurObjSetActiveTrace.LogPatchStatus();
             SkillMakeStrColFieldTrace.LogPatchStatus();
-            CmpMenuCursorTrace.LogPatchStatus();
             LoggerInstance.Msg(
                 "[NocturneModernGameplay] Loaded standalone; " +
                 "GUI metadata bridge is optional.");
@@ -62,8 +60,18 @@ namespace NocturneModernGameplay
             }
             GuiMetadataBridge.SampleToggleRequests();
             GameplayFeatureRegistry.Sample();
-            StatusUiFieldOffsetProbe.TryProbe();
-            SelectSkillIdOffsetProbe.TryProbe();
+            // StatusUiFieldOffsetProbe.TryProbe() and SelectSkillIdOffsetProbe
+            // .TryProbe() (both HIDDEN NEW SKILL ENTRY field-offset probes,
+            // closed below) were removed from here and moved to
+            // legacy/skillmutationv3/*.Legacy.cs, alongside CmpMenuCursorTrace
+            // and SkillCurObjSetActiveTrace. SkillCurObjSetActiveTrace (an
+            // unconditional Harmony Prefix on UnityEngine.GameObject.SetActive,
+            // i.e. every SetActive() call in the whole game) was confirmed by
+            // real-machine A/B/A to cause a lasting Field slowdown after
+            // opening SMT3HD's native Controller Key Config screen; the other
+            // three were retired at the same time since this investigation was
+            // already closed and none of them should still be patching/probing
+            // in production.
             // HIDDEN NEW SKILL ENTRY investigation: CLOSED (2026-09-15, see
             // investigations/HIDDEN_SKILL_ENTRY/PLAN.md). Root cause
             // (Frost's ordinary, non-transformed `hensinmae==0` state means
